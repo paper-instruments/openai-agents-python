@@ -900,23 +900,25 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 pty_processes=self._pty_sessions,
                 session_id=session_id,
             )
-            entry.termination_pending = True
 
         async with entry.operation_lock:
-            pass
-
-        await self._terminate_pty_entry(entry, best_effort=False)
-        async with entry.output_poll_lock:
-            output, original_token_count = await self._collect_pty_output(
-                entry=entry,
-                yield_time_ms=0,
-                max_output_tokens=None,
-            )
             async with self._pty_lock:
                 if self._pty_sessions.get(session_id) is not entry:
                     raise PtySessionNotFoundError(session_id=session_id)
-                self._pty_sessions.pop(session_id)
-                self._reserved_pty_process_ids.discard(session_id)
+                entry.termination_pending = True
+
+            await self._terminate_pty_entry(entry, best_effort=False)
+            async with entry.output_poll_lock:
+                async with self._pty_lock:
+                    if self._pty_sessions.get(session_id) is not entry:
+                        raise PtySessionNotFoundError(session_id=session_id)
+                    output, original_token_count = await self._collect_pty_output(
+                        entry=entry,
+                        yield_time_ms=0,
+                        max_output_tokens=None,
+                    )
+                    self._pty_sessions.pop(session_id)
+                    self._reserved_pty_process_ids.discard(session_id)
         return PtyExecUpdate(
             process_id=None,
             output=output,

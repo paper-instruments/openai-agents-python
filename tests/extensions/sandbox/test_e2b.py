@@ -55,6 +55,7 @@ from agents.sandbox.files import EntryKind
 from agents.sandbox.materialization import MaterializedFile
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.dependencies import Dependencies
+from agents.sandbox.session.pty_types import PtyExecUpdate
 from agents.sandbox.session.runtime_helpers import (
     RESOLVE_WORKSPACE_PATH_HELPER,
     WORKSPACE_FINGERPRINT_HELPER,
@@ -2128,6 +2129,38 @@ async def test_e2b_targeted_pty_termination_interrupts_empty_output_poll() -> No
 
     assert polled.process_id == started.process_id
     assert terminated.process_id is None
+
+
+@pytest.mark.asyncio
+async def test_e2b_concurrent_targeted_termination_kills_once() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+
+    first, second = await asyncio.gather(
+        session.pty_terminate(started.process_id),
+        session.pty_terminate(started.process_id),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, PtyExecUpdate) for result in (first, second)) == 1
+    assert sum(
+        isinstance(result, PtySessionNotFoundError) for result in (first, second)
+    ) == 1
+    assert sandbox.pty.handle.kill_calls == 1
 
 
 @pytest.mark.asyncio

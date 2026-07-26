@@ -49,6 +49,7 @@ from agents.sandbox.session.base_sandbox_session import (
     BaseSandboxSession,
 )
 from agents.sandbox.session.dependencies import Dependencies
+from agents.sandbox.session.pty_types import PtyExecUpdate
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExecResult, ExposedPortEndpoint, User
 from tests._fake_workspace_paths import resolve_fake_workspace_path
@@ -1769,6 +1770,41 @@ class TestDaytonaSandbox:
 
         assert polled.process_id == started.process_id
         assert terminated.process_id is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_targeted_termination_kills_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+
+        first, second = await asyncio.gather(
+            session.pty_terminate(started.process_id),
+            session.pty_terminate(started.process_id),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, PtyExecUpdate) for result in (first, second)) == 1
+        assert sum(
+            isinstance(result, PtySessionNotFoundError) for result in (first, second)
+        ) == 1
+        assert sandbox.process.kill_pty_session_calls == [
+            next(iter(sandbox.process._pty_handles))
+        ]
 
     @pytest.mark.asyncio
     async def test_cancelled_targeted_termination_preserves_terminal_output(
