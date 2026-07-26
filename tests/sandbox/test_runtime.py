@@ -80,6 +80,7 @@ from agents.sandbox.sandboxes.unix_local import (
 )
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.dependencies import Dependencies
+from agents.sandbox.session.pty_types import PtyExecUpdate
 from agents.sandbox.session.runtime_helpers import RuntimeHelperScript
 from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
@@ -176,6 +177,21 @@ class _FailingStopSession(_FakeSession):
     async def stop(self) -> None:
         await super().stop()
         raise RuntimeError("stop failed")
+
+
+class _PtyTerminatingSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.terminated_session_ids: list[int] = []
+
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        self.terminated_session_ids.append(session_id)
+        return PtyExecUpdate(
+            process_id=None,
+            output=b"tail",
+            exit_code=-9,
+            original_token_count=None,
+        )
 
 
 class _LiveSessionDeltaRecorder(_FakeSession):
@@ -412,6 +428,30 @@ async def test_sandbox_session_routes_helper_path_checks_to_inner_session() -> N
         Path("link/file.txt"),
         Path("bundle.tar"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_session_forwards_targeted_pty_termination() -> None:
+    inner = _PtyTerminatingSession(Manifest(root="/workspace"))
+    session = SandboxSession(inner)
+
+    result = await session.pty_terminate(1234)
+
+    assert result == PtyExecUpdate(
+        process_id=None,
+        output=b"tail",
+        exit_code=-9,
+        original_token_count=None,
+    )
+    assert inner.terminated_session_ids == [1234]
+
+
+@pytest.mark.asyncio
+async def test_base_session_rejects_targeted_pty_termination_when_unsupported() -> None:
+    session = _FakeSession(Manifest(root="/workspace"))
+
+    with pytest.raises(NotImplementedError, match="PTY execution is not supported"):
+        await session.pty_terminate(1234)
 
 
 @pytest.mark.asyncio

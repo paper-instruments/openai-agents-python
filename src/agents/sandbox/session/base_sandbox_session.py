@@ -667,6 +667,17 @@ class BaseSandboxSession(abc.ABC):
         _ = (session_id, chars, yield_time_s, max_output_tokens)
         raise NotImplementedError("PTY execution is not supported by this sandbox session")
 
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        """Terminate one PTY session and return its final unread output.
+
+        Implementations must remove only ``session_id`` from their local registry, terminate the
+        corresponding provider process through the backend's normal cleanup path, and return a
+        terminal update whose ``process_id`` is ``None``. Unknown or already-retired session IDs
+        must raise :class:`PtySessionNotFoundError`.
+        """
+        _ = session_id
+        raise NotImplementedError("PTY execution is not supported by this sandbox session")
+
     async def pty_terminate_all(self) -> None:
         return
 

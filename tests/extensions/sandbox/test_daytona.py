@@ -35,7 +35,12 @@ from agents.sandbox.entries import (
     S3Mount,
 )
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
-from agents.sandbox.errors import ExecTimeoutError, ExecTransportError, MountConfigError
+from agents.sandbox.errors import (
+    ExecTimeoutError,
+    ExecTransportError,
+    MountConfigError,
+    PtySessionNotFoundError,
+)
 from agents.sandbox.files import EntryKind
 from agents.sandbox.manifest import Environment
 from agents.sandbox.materialization import MaterializedFile
@@ -110,6 +115,10 @@ class _FakeProcess:
         self.create_session_error: BaseException | None = None
         self.create_session_delay_s: float = 0.0
         self.kill_pty_session_calls: list[str] = []
+        self.kill_pty_session_error: BaseException | None = None
+        self.kill_pty_output: bytes | str | None = None
+        self.kill_pty_session_started = asyncio.Event()
+        self.kill_pty_session_release: asyncio.Event | None = None
         self.delete_session_calls: list[str] = []
         self.execute_session_command_calls: list[tuple[str, object, dict[str, object]]] = []
         self.get_session_command_logs_error: BaseException | None = None
@@ -142,6 +151,17 @@ class _FakeProcess:
 
     async def kill_pty_session(self, session_id: str) -> None:
         self.kill_pty_session_calls.append(session_id)
+        if self.kill_pty_session_error is not None:
+            raise self.kill_pty_session_error
+        handle = self._pty_handles.get(session_id)
+        if handle is not None:
+            if self.kill_pty_output is not None:
+                await cast(Any, handle._on_data)(self.kill_pty_output)
+            handle.exit_code = 137
+            handle._done.set()
+        self.kill_pty_session_started.set()
+        if self.kill_pty_session_release is not None:
+            await self.kill_pty_session_release.wait()
 
     async def create_session(self, session_id: str) -> None:
         self.create_session_calls.append(session_id)
@@ -1561,6 +1581,335 @@ class TestDaytonaSandbox:
 
         assert finalizer_finished.is_set()
         assert entry.worker_task is None
+        assert sandbox.process.delete_session_calls == ["session-123"]
+
+    @pytest.mark.asyncio
+    async def test_targeted_pty_termination_leaves_other_session_registered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        first = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="provider-first",
+            pty_handle=object(),
+            tty=True,
+        )
+        second = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="provider-second",
+            pty_handle=object(),
+            tty=True,
+        )
+        first.output_chunks.append(b"tail")
+        session._pty_sessions = {1001: first, 1002: second}  # noqa: SLF001
+        session._reserved_pty_process_ids = {1001, 1002}  # noqa: SLF001
+
+        terminated = await session.pty_terminate(1001)
+
+        assert terminated.process_id is None
+        assert terminated.output == b"tail"
+        assert session._pty_sessions == {1002: second}  # noqa: SLF001
+        assert session._reserved_pty_process_ids == {1002}  # noqa: SLF001
+        assert sandbox.process.kill_pty_session_calls == ["provider-first"]
+        with pytest.raises(PtySessionNotFoundError):
+            await session.pty_terminate(1001)
+
+    @pytest.mark.asyncio
+    async def test_targeted_pty_termination_drains_terminal_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        sandbox.process.kill_pty_output = b"tail"
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+
+        terminated = await session.pty_terminate(started.process_id)
+
+        assert terminated.process_id is None
+        assert terminated.output == b"tail"
+        assert terminated.exit_code == 137
+
+    @pytest.mark.asyncio
+    async def test_targeted_pty_termination_failure_keeps_session_registered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+        entry = session._pty_sessions[started.process_id]  # noqa: SLF001
+        sandbox.process.kill_pty_session_error = RuntimeError("kill failed")
+
+        with pytest.raises(RuntimeError, match="kill failed"):
+            await session.pty_terminate(started.process_id)
+
+        assert session._pty_sessions[started.process_id] is entry  # noqa: SLF001
+        assert started.process_id in session._reserved_pty_process_ids  # noqa: SLF001
+
+        sandbox.process.kill_pty_session_error = None
+        await session.pty_terminate(started.process_id)
+
+    @pytest.mark.asyncio
+    async def test_targeted_pty_termination_serializes_with_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+        entry = session._pty_sessions[started.process_id]  # noqa: SLF001
+        write_started = asyncio.Event()
+        release_write = asyncio.Event()
+        original_send_input = entry.pty_handle.send_input
+
+        async def blocked_send_input(chars: str) -> None:
+            write_started.set()
+            await release_write.wait()
+            await original_send_input(chars)
+
+        monkeypatch.setattr(entry.pty_handle, "send_input", blocked_send_input)
+        write_task = asyncio.create_task(
+            session.pty_write_stdin(
+                session_id=started.process_id,
+                chars="1 + 1\n",
+                yield_time_s=0,
+            )
+        )
+        await write_started.wait()
+        terminate_task = asyncio.create_task(session.pty_terminate(started.process_id))
+        await asyncio.sleep(0)
+
+        assert not terminate_task.done()
+
+        release_write.set()
+        updated = await write_task
+        terminated = await terminate_task
+
+        assert updated.process_id == started.process_id
+        assert terminated.process_id is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_targeted_termination_preserves_terminal_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+        entry = session._pty_sessions[started.process_id]  # noqa: SLF001
+        entry.last_used = 0
+        sandbox.process.kill_pty_output = b"tail"
+        sandbox.process.kill_pty_session_release = asyncio.Event()
+        terminate_task = asyncio.create_task(session.pty_terminate(started.process_id))
+        await sandbox.process.kill_pty_session_started.wait()
+        assert entry.termination_pending
+        for process_id in range(1_000, 1_064):
+            if process_id == started.process_id:
+                continue
+            sibling = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+                daytona_session_id=f"provider-{process_id}",
+                pty_handle=object(),
+                tty=True,
+            )
+            sibling.last_used = float(process_id)
+            session._pty_sessions[process_id] = sibling  # noqa: SLF001
+            session._reserved_pty_process_ids.add(process_id)  # noqa: SLF001
+        pruned = session._prune_pty_sessions_if_needed()  # noqa: SLF001
+        assert pruned is not entry
+        assert session._pty_sessions[started.process_id] is entry  # noqa: SLF001
+
+        await session._pty_lock.acquire()  # noqa: SLF001
+        sandbox.process.kill_pty_session_release.set()
+        for _ in range(20):
+            if entry.worker_task is not None and entry.worker_task.done():
+                break
+            await asyncio.sleep(0)
+        terminate_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await terminate_task
+
+        session._pty_lock.release()  # noqa: SLF001
+        assert session._pty_sessions[started.process_id] is entry  # noqa: SLF001
+        assert started.process_id in session._reserved_pty_process_ids  # noqa: SLF001
+        assert list(entry.output_chunks) == [b"tail"]
+
+        class _FakeNotFound(Exception):
+            pass
+
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_not_found_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        sandbox.process.kill_pty_session_error = _FakeNotFound("already terminated")
+        sandbox.process.kill_pty_session_release = None
+        retried = await session.pty_terminate(started.process_id)
+
+        assert retried.output == b"tail"
+
+    @pytest.mark.asyncio
+    async def test_targeted_termination_fails_if_output_worker_will_not_stop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        monkeypatch.setattr(state.timeouts, "cleanup_s", 0.01)
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="provider-first",
+            pty_handle=object(),
+            tty=True,
+        )
+        release_worker = asyncio.Event()
+
+        async def cancellation_resistant_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release_worker.wait()
+
+        entry.worker_task = asyncio.create_task(cancellation_resistant_worker())
+        session._pty_sessions = {1001: entry}  # noqa: SLF001
+        session._reserved_pty_process_ids = {1001}  # noqa: SLF001
+
+        with pytest.raises(TimeoutError, match="output worker did not stop"):
+            await session.pty_terminate(1001)
+
+        assert session._pty_sessions[1001] is entry  # noqa: SLF001
+        assert entry.termination_pending
+        with pytest.raises(PtySessionNotFoundError):
+            await session.pty_write_stdin(
+                session_id=1001,
+                chars="",
+                yield_time_s=0,
+            )
+
+        release_worker.set()
+        await entry.worker_task
+        await session.pty_terminate(1001)
+
+    @pytest.mark.asyncio
+    async def test_pty_start_rejects_capacity_full_of_terminating_sessions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        session._pty_sessions = {  # noqa: SLF001
+            process_id: daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+                daytona_session_id=f"provider-{process_id}",
+                pty_handle=object(),
+                tty=True,
+                termination_pending=True,
+            )
+            for process_id in range(1_000, 1_064)
+        }
+        session._reserved_pty_process_ids = set(session._pty_sessions)  # noqa: SLF001
+
+        with pytest.raises(ExecTransportError) as exc_info:
+            await session.pty_exec_start(
+                "python3",
+                shell=False,
+                tty=True,
+                yield_time_s=0,
+            )
+
+        assert "PTY process limit reached" in str(exc_info.value.__cause__)
+        assert len(session._pty_sessions) == 64  # noqa: SLF001
+        assert sandbox.process.kill_pty_session_calls
+
+    @pytest.mark.asyncio
+    async def test_completed_non_tty_entry_still_deletes_provider_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=object(),
+            tty=False,
+            cmd_id="cmd-123",
+            done=True,
+            exit_code=0,
+        )
+
+        await session._terminate_pty_entry(entry, best_effort=False)  # noqa: SLF001
+
         assert sandbox.process.delete_session_calls == ["session-123"]
 
     @pytest.mark.asyncio

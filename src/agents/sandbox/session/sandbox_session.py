@@ -596,6 +596,9 @@ class SandboxSession(BaseSandboxSession):
             max_output_tokens=max_output_tokens,
         )
 
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        return await self._inner.pty_terminate(session_id)
+
     async def pty_terminate_all(self) -> None:
         await self._inner.pty_terminate_all()
 
