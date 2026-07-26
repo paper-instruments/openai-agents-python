@@ -2157,9 +2157,7 @@ async def test_e2b_concurrent_targeted_termination_kills_once() -> None:
     )
 
     assert sum(isinstance(result, PtyExecUpdate) for result in (first, second)) == 1
-    assert sum(
-        isinstance(result, PtySessionNotFoundError) for result in (first, second)
-    ) == 1
+    assert sum(isinstance(result, PtySessionNotFoundError) for result in (first, second)) == 1
     assert sandbox.pty.handle.kill_calls == 1
 
 

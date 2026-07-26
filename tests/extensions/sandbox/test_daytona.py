@@ -1792,19 +1792,16 @@ class TestDaytonaSandbox:
         )
         assert started.process_id is not None
 
-        first, second = await asyncio.gather(
+        results: tuple[PtyExecUpdate | BaseException, PtyExecUpdate | BaseException]
+        results = await asyncio.gather(
             session.pty_terminate(started.process_id),
             session.pty_terminate(started.process_id),
             return_exceptions=True,
         )
 
-        assert sum(isinstance(result, PtyExecUpdate) for result in (first, second)) == 1
-        assert sum(
-            isinstance(result, PtySessionNotFoundError) for result in (first, second)
-        ) == 1
-        assert sandbox.process.kill_pty_session_calls == [
-            next(iter(sandbox.process._pty_handles))
-        ]
+        assert sum(isinstance(result, PtyExecUpdate) for result in results) == 1
+        assert sum(isinstance(result, PtySessionNotFoundError) for result in results) == 1
+        assert sandbox.process.kill_pty_session_calls == [next(iter(sandbox.process._pty_handles))]
 
     @pytest.mark.asyncio
     async def test_targeted_termination_racing_global_cleanup_kills_once(
@@ -1837,9 +1834,7 @@ class TestDaytonaSandbox:
         await global_cleanup
         with pytest.raises(PtySessionNotFoundError):
             await targeted
-        assert sandbox.process.kill_pty_session_calls == [
-            next(iter(sandbox.process._pty_handles))
-        ]
+        assert sandbox.process.kill_pty_session_calls == [next(iter(sandbox.process._pty_handles))]
 
     @pytest.mark.asyncio
     async def test_cancelled_targeted_termination_preserves_terminal_output(
