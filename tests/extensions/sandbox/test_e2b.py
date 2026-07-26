@@ -2093,6 +2093,44 @@ async def test_e2b_targeted_pty_termination_serializes_with_write(
 
 
 @pytest.mark.asyncio
+async def test_e2b_targeted_pty_termination_interrupts_empty_output_poll() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+
+    poll = asyncio.create_task(
+        session.pty_write_stdin(
+            session_id=started.process_id,
+            chars="",
+            yield_time_s=30,
+        )
+    )
+    await asyncio.sleep(0)
+
+    terminated = await asyncio.wait_for(
+        session.pty_terminate(started.process_id),
+        timeout=0.5,
+    )
+    polled = await poll
+
+    assert polled.process_id == started.process_id
+    assert terminated.process_id is None
+
+
+@pytest.mark.asyncio
 async def test_e2b_cancelled_targeted_termination_preserves_terminal_output() -> None:
     sandbox = _FakeE2BSandbox()
     state = E2BSandboxSessionState(

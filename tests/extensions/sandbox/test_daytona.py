@@ -1732,6 +1732,45 @@ class TestDaytonaSandbox:
         assert terminated.process_id is None
 
     @pytest.mark.asyncio
+    async def test_targeted_pty_termination_interrupts_empty_output_poll(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+
+        poll = asyncio.create_task(
+            session.pty_write_stdin(
+                session_id=started.process_id,
+                chars="",
+                yield_time_s=30,
+            )
+        )
+        await asyncio.sleep(0)
+
+        terminated = await asyncio.wait_for(
+            session.pty_terminate(started.process_id),
+            timeout=0.5,
+        )
+        polled = await poll
+
+        assert polled.process_id == started.process_id
+        assert terminated.process_id is None
+
+    @pytest.mark.asyncio
     async def test_cancelled_targeted_termination_preserves_terminal_output(
         self,
         monkeypatch: pytest.MonkeyPatch,

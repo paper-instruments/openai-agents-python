@@ -684,6 +684,7 @@ class _E2BPtyProcessEntry:
     handle: object
     tty: bool
     operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     termination_pending: bool = False
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -1056,7 +1057,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 process_count,
             )
 
-        async with entry.operation_lock:
+        async with entry.output_poll_lock:
             yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
             output, original_token_count = await self._collect_pty_output(
                 entry=entry,
@@ -1101,6 +1102,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 )
                 await asyncio.sleep(0.1)
 
+        async with entry.output_poll_lock:
             yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
             output, original_token_count = await self._collect_pty_output(
                 entry=entry,
@@ -1123,30 +1125,29 @@ class E2BSandboxSession(BaseSandboxSession):
                 pty_processes=self._pty_processes,
                 session_id=session_id,
             )
+            entry.termination_pending = True
 
         async with entry.operation_lock:
-            async with self._pty_lock:
-                if self._pty_processes.get(session_id) is not entry:
-                    raise PtySessionNotFoundError(session_id=session_id)
-                entry.termination_pending = True
+            pass
 
-            await self._terminate_pty_entry(entry, best_effort=False)
+        await self._terminate_pty_entry(entry, best_effort=False)
+        async with entry.output_poll_lock:
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=0,
+                max_output_tokens=None,
+            )
             async with self._pty_lock:
                 if self._pty_processes.get(session_id) is not entry:
                     raise PtySessionNotFoundError(session_id=session_id)
-                output, original_token_count = await self._collect_pty_output(
-                    entry=entry,
-                    yield_time_ms=0,
-                    max_output_tokens=None,
-                )
                 self._pty_processes.pop(session_id)
                 self._reserved_pty_process_ids.discard(session_id)
-            return PtyExecUpdate(
-                process_id=None,
-                output=output,
-                exit_code=self._entry_exit_code(entry),
-                original_token_count=original_token_count,
-            )
+        return PtyExecUpdate(
+            process_id=None,
+            output=output,
+            exit_code=self._entry_exit_code(entry),
+            original_token_count=original_token_count,
+        )
 
     async def pty_terminate_all(self) -> None:
         async with self._pty_lock:
@@ -1158,11 +1159,11 @@ class E2BSandboxSession(BaseSandboxSession):
                     if self._pty_processes.get(process_id) is not entry:
                         continue
                     entry.termination_pending = True
-                await self._terminate_pty_entry(entry)
-                async with self._pty_lock:
-                    if self._pty_processes.get(process_id) is entry:
-                        self._pty_processes.pop(process_id)
-                        self._reserved_pty_process_ids.discard(process_id)
+            await self._terminate_pty_entry(entry)
+            async with self._pty_lock:
+                if self._pty_processes.get(process_id) is entry:
+                    self._pty_processes.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
@@ -1325,7 +1326,7 @@ class E2BSandboxSession(BaseSandboxSession):
         exit_code = self._entry_exit_code(entry)
         live_process_id: int | None = process_id
 
-        if exit_code is not None:
+        if exit_code is not None and not entry.termination_pending:
             async with self._pty_lock:
                 removed = self._pty_processes.pop(process_id, None)
                 self._reserved_pty_process_ids.discard(process_id)
