@@ -32,6 +32,7 @@ from ....sandbox.errors import (
     ExecTransportError,
     ExposedPortUnavailableError,
     InvalidManifestPathError as InvalidManifestPathError,
+    PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -382,6 +383,8 @@ class _DaytonaPtySessionEntry:
     pty_handle: Any
     tty: bool = True
     cmd_id: str | None = None
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    termination_pending: bool = False
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
@@ -713,6 +716,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
                 self._reserved_pty_process_ids.add(process_id)
                 pruned = self._prune_pty_sessions_if_needed()
+                if len(self._pty_sessions) >= PTY_PROCESSES_MAX and pruned is None:
+                    self._reserved_pty_process_ids.discard(process_id)
+                    raise RuntimeError(
+                        "PTY process limit reached while all registered sessions are terminating"
+                    )
                 self._pty_sessions[process_id] = entry
                 process_count = len(self._pty_sessions)
                 registered = True
@@ -744,7 +752,8 @@ class DaytonaSandboxSession(BaseSandboxSession):
             raise
 
         if pruned is not None:
-            await self._terminate_pty_entry(pruned)
+            async with pruned.operation_lock:
+                await self._terminate_pty_entry(pruned)
 
         if process_count >= PTY_PROCESSES_WARNING:
             logger.warning(
@@ -752,18 +761,19 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 process_count,
             )
 
-        yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-            max_output_tokens=max_output_tokens,
-        )
-        return await self._finalize_pty_update(
-            process_id=process_id,
-            entry=entry,
-            output=output,
-            original_token_count=original_token_count,
-        )
+        async with entry.operation_lock:
+            yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                max_output_tokens=max_output_tokens,
+            )
+            return await self._finalize_pty_update(
+                process_id=process_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
 
     async def _run_pty_waiter(self, entry: _DaytonaPtySessionEntry) -> None:
         try:
@@ -820,30 +830,37 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
-        if chars:
-            if not entry.tty:
-                raise RuntimeError("stdin is not available for this process")
-            await asyncio.wait_for(
-                entry.pty_handle.send_input(chars),
-                timeout=self.state.timeouts.fast_op_s,
-            )
-            await asyncio.sleep(0.1)
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_sessions.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+                if entry.termination_pending:
+                    raise PtySessionNotFoundError(session_id=session_id)
 
-        yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=resolve_pty_write_yield_time_ms(
-                yield_time_ms=yield_time_ms, input_empty=chars == ""
-            ),
-            max_output_tokens=max_output_tokens,
-        )
-        entry.last_used = time.monotonic()
-        return await self._finalize_pty_update(
-            process_id=session_id,
-            entry=entry,
-            output=output,
-            original_token_count=original_token_count,
-        )
+            if chars:
+                if not entry.tty:
+                    raise RuntimeError("stdin is not available for this process")
+                await asyncio.wait_for(
+                    entry.pty_handle.send_input(chars),
+                    timeout=self.state.timeouts.fast_op_s,
+                )
+                await asyncio.sleep(0.1)
+
+            yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=resolve_pty_write_yield_time_ms(
+                    yield_time_ms=yield_time_ms, input_empty=chars == ""
+                ),
+                max_output_tokens=max_output_tokens,
+            )
+            entry.last_used = time.monotonic()
+            return await self._finalize_pty_update(
+                process_id=session_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
 
     async def _finalize_pty_update(
         self,
@@ -863,6 +880,10 @@ class DaytonaSandboxSession(BaseSandboxSession):
             if removed is not None:
                 await self._terminate_pty_entry(removed)
             live_process_id = None
+        else:
+            async with self._pty_lock:
+                if self._pty_sessions.get(process_id) is not entry:
+                    live_process_id = None
 
         return PtyExecUpdate(
             process_id=live_process_id,
@@ -871,13 +892,51 @@ class DaytonaSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        async with self._pty_lock:
+            entry = self._resolve_pty_session_entry(
+                pty_processes=self._pty_sessions,
+                session_id=session_id,
+            )
+
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_sessions.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+                entry.termination_pending = True
+
+            await self._terminate_pty_entry(entry, best_effort=False)
+            async with self._pty_lock:
+                if self._pty_sessions.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=0,
+                    max_output_tokens=None,
+                )
+                self._pty_sessions.pop(session_id)
+                self._reserved_pty_process_ids.discard(session_id)
+            return PtyExecUpdate(
+                process_id=None,
+                output=output,
+                exit_code=entry.exit_code,
+                original_token_count=original_token_count,
+            )
+
     async def pty_terminate_all(self) -> None:
         async with self._pty_lock:
-            entries = list(self._pty_sessions.values())
-            self._pty_sessions.clear()
-            self._reserved_pty_process_ids.clear()
-        for entry in entries:
-            await self._terminate_pty_entry(entry)
+            entries = list(self._pty_sessions.items())
+        for process_id, entry in entries:
+            async with entry.operation_lock:
+                async with self._pty_lock:
+                    if self._pty_sessions.get(process_id) is not entry:
+                        continue
+                    entry.termination_pending = True
+                await self._terminate_pty_entry(entry)
+                async with self._pty_lock:
+                    if self._pty_sessions.get(process_id) is entry:
+                        self._pty_sessions.pop(process_id)
+                        self._reserved_pty_process_ids.discard(process_id)
 
     async def _collect_pty_output(
         self,
@@ -899,7 +958,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if len(self._pty_sessions) < PTY_PROCESSES_MAX:
             return None
         meta: list[tuple[int, float, bool]] = [
-            (pid, entry.last_used, entry.done) for pid, entry in self._pty_sessions.items()
+            (pid, entry.last_used, entry.done)
+            for pid, entry in self._pty_sessions.items()
+            if not entry.termination_pending
         ]
         pid = process_id_to_prune_from_meta(meta)
         if pid is None:
@@ -907,27 +968,65 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._reserved_pty_process_ids.discard(pid)
         return self._pty_sessions.pop(pid, None)
 
-    async def _terminate_pty_entry(self, entry: _DaytonaPtySessionEntry) -> None:
+    async def _terminate_pty_entry(
+        self,
+        entry: _DaytonaPtySessionEntry,
+        *,
+        best_effort: bool = True,
+    ) -> None:
         try:
             if entry.tty:
                 await self._sandbox.process.kill_pty_session(entry.daytona_session_id)
             else:
                 await self._sandbox.process.delete_session(entry.daytona_session_id)
-        except Exception:
-            pass
-        finally:
-            worker_task = entry.worker_task
+        except Exception as error:
+            not_found_error_types = _daytona_not_found_error_types()
+            if not_found_error_types and isinstance(error, not_found_error_types):
+                await self._quiesce_pty_worker(entry, best_effort=best_effort)
+                return
+            if not best_effort:
+                raise
+        else:
+            await self._quiesce_pty_worker(entry, best_effort=best_effort)
+            return
+
+        await self._quiesce_pty_worker(entry, best_effort=True)
+
+    async def _quiesce_pty_worker(
+        self,
+        entry: _DaytonaPtySessionEntry,
+        *,
+        best_effort: bool,
+    ) -> None:
+        worker_task = entry.worker_task
+        if worker_task is None or worker_task is asyncio.current_task():
+            return
+
+        if best_effort:
+            if not worker_task.done():
+                worker_task.cancel()
+        else:
+            _, pending = await asyncio.wait(
+                {worker_task},
+                timeout=self.state.timeouts.cleanup_s,
+            )
+            if pending:
+                worker_task.cancel()
+
+        _, pending = await asyncio.wait(
+            {worker_task},
+            timeout=self.state.timeouts.cleanup_s,
+        )
+        if pending and best_effort:
+            worker_task.cancel()
+            _, pending = await asyncio.wait(
+                {worker_task},
+                timeout=self.state.timeouts.cleanup_s,
+            )
+        if pending and not best_effort:
+            raise TimeoutError("Daytona PTY output worker did not stop after termination")
+        if not pending:
             entry.worker_task = None
-            if worker_task is not None and worker_task is not asyncio.current_task():
-                if not worker_task.done():
-                    worker_task.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(worker_task, return_exceptions=True),
-                        timeout=self.state.timeouts.cleanup_s,
-                    )
-                except asyncio.TimeoutError:
-                    pass
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         error_path = posix_path_as_path(coerce_posix_path(path))

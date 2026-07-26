@@ -46,6 +46,7 @@ from agents.sandbox.errors import (
     ExecTransportError,
     InvalidManifestPathError,
     MountConfigError,
+    PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceStartError,
@@ -240,13 +241,16 @@ class _FakeE2BAsyncCommandHandle:
         self.wait_calls = 0
         self.wait_cancelled = False
         self.kill_calls = 0
+        self.kill_error: BaseException | None = None
+        self.kill_hook: object | None = None
+        self._killed = asyncio.Event()
         self._wait_released = asyncio.Event()
 
     async def wait(self) -> _FakeE2BResult:
         self.wait_calls += 1
         try:
             if self.wait_never:
-                await asyncio.Event().wait()
+                await self._killed.wait()
             if self.wait_until_released:
                 await self._wait_released.wait()
             if self.wait_delay_s:
@@ -261,7 +265,13 @@ class _FakeE2BAsyncCommandHandle:
 
     async def kill(self) -> bool:
         self.kill_calls += 1
-        self.exit_code = 0
+        if self.kill_error is not None:
+            raise self.kill_error
+        if callable(self.kill_hook):
+            result = self.kill_hook()
+            if inspect.isawaitable(result):
+                await result
+        self._killed.set()
         return True
 
     def release_wait(self) -> None:
@@ -1946,6 +1956,296 @@ async def test_e2b_pty_start_and_write_stdin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_e2b_targeted_pty_termination_leaves_other_session_registered() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    first = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert first.process_id is not None
+    assert sandbox.pty.on_data is not None
+
+    async def emit_tail() -> None:
+        callback = sandbox.pty.on_data
+        assert callable(callback)
+        result = callback(b"tail")
+        if inspect.isawaitable(result):
+            await result
+
+    sandbox.pty.handle.kill_hook = emit_tail
+    second_handle = _FakeE2BPtyHandle()
+    second_entry = e2b_module._E2BPtyProcessEntry(  # noqa: SLF001
+        handle=second_handle,
+        tty=True,
+    )
+    second_id = 1002 if first.process_id != 1002 else 1003
+    session._pty_processes[second_id] = second_entry  # noqa: SLF001
+    session._reserved_pty_process_ids.add(second_id)  # noqa: SLF001
+
+    terminated = await session.pty_terminate(first.process_id)
+
+    assert terminated.process_id is None
+    assert terminated.output == b"tail"
+    assert terminated.exit_code == 0
+    assert sandbox.pty.handle.kill_calls == 1
+    assert session._pty_processes == {second_id: second_entry}  # noqa: SLF001
+    assert second_handle.kill_calls == 0
+    with pytest.raises(PtySessionNotFoundError):
+        await session.pty_terminate(first.process_id)
+
+    await session.pty_terminate_all()
+
+
+@pytest.mark.asyncio
+async def test_e2b_targeted_pty_termination_failure_keeps_session_registered() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+    entry = session._pty_processes[started.process_id]  # noqa: SLF001
+    sandbox.pty.handle.kill_error = RuntimeError("kill failed")
+
+    with pytest.raises(RuntimeError, match="kill failed"):
+        await session.pty_terminate(started.process_id)
+
+    assert session._pty_processes[started.process_id] is entry  # noqa: SLF001
+    assert started.process_id in session._reserved_pty_process_ids  # noqa: SLF001
+
+    sandbox.pty.handle.kill_error = None
+    await session.pty_terminate(started.process_id)
+
+
+@pytest.mark.asyncio
+async def test_e2b_targeted_pty_termination_serializes_with_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "python3",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    original_send_stdin = sandbox.pty.send_stdin
+
+    async def blocked_send_stdin(
+        pid: object,
+        data: bytes,
+        request_timeout: float | None = None,
+    ) -> None:
+        write_started.set()
+        await release_write.wait()
+        await original_send_stdin(pid, data, request_timeout)
+
+    monkeypatch.setattr(sandbox.pty, "send_stdin", blocked_send_stdin)
+    write_task = asyncio.create_task(
+        session.pty_write_stdin(
+            session_id=started.process_id,
+            chars="1 + 1\n",
+            yield_time_s=0,
+        )
+    )
+    await write_started.wait()
+    terminate_task = asyncio.create_task(session.pty_terminate(started.process_id))
+    await asyncio.sleep(0)
+
+    assert not terminate_task.done()
+
+    release_write.set()
+    updated = await write_task
+    terminated = await terminate_task
+
+    assert updated.process_id == started.process_id
+    assert terminated.process_id is None
+
+
+@pytest.mark.asyncio
+async def test_e2b_cancelled_targeted_termination_preserves_terminal_output() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+    entry = session._pty_processes[started.process_id]  # noqa: SLF001
+    entry.last_used = 0
+    kill_output_ready = asyncio.Event()
+    release_kill = asyncio.Event()
+    assert sandbox.pty.on_data is not None
+
+    async def emit_tail_then_block() -> None:
+        callback = sandbox.pty.on_data
+        assert callable(callback)
+        result = callback(b"tail")
+        if inspect.isawaitable(result):
+            await result
+        kill_output_ready.set()
+        await release_kill.wait()
+
+    sandbox.pty.handle.kill_hook = emit_tail_then_block
+    terminate_task = asyncio.create_task(session.pty_terminate(started.process_id))
+    await kill_output_ready.wait()
+    assert entry.termination_pending
+    for process_id in range(1_000, 1_064):
+        if process_id == started.process_id:
+            continue
+        sibling = e2b_module._E2BPtyProcessEntry(  # noqa: SLF001
+            handle=_FakeE2BPtyHandle(),
+            tty=True,
+        )
+        sibling.last_used = float(process_id)
+        session._pty_processes[process_id] = sibling  # noqa: SLF001
+        session._reserved_pty_process_ids.add(process_id)  # noqa: SLF001
+    pruned = session._prune_pty_processes_if_needed()  # noqa: SLF001
+    assert pruned is not entry
+    assert session._pty_processes[started.process_id] is entry  # noqa: SLF001
+
+    await session._pty_lock.acquire()  # noqa: SLF001
+    release_kill.set()
+    for _ in range(20):
+        if entry.wait_task is not None and entry.wait_task.done():
+            break
+        await asyncio.sleep(0)
+    terminate_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await terminate_task
+
+    session._pty_lock.release()  # noqa: SLF001
+    assert session._pty_processes[started.process_id] is entry  # noqa: SLF001
+    assert started.process_id in session._reserved_pty_process_ids  # noqa: SLF001
+    assert list(entry.output_chunks) == [b"tail"]
+
+    retried = await session.pty_terminate(started.process_id)
+
+    assert retried.output == b"tail"
+
+
+@pytest.mark.asyncio
+async def test_e2b_targeted_termination_fails_if_output_waiter_will_not_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    monkeypatch.setattr(state.timeouts, "cleanup_s", 0.01)
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    entry = e2b_module._E2BPtyProcessEntry(  # noqa: SLF001
+        handle=sandbox.pty.handle,
+        tty=True,
+    )
+    release_waiter = asyncio.Event()
+
+    async def cancellation_resistant_waiter() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release_waiter.wait()
+
+    entry.wait_task = asyncio.create_task(cancellation_resistant_waiter())
+    session._pty_processes = {1001: entry}  # noqa: SLF001
+    session._reserved_pty_process_ids = {1001}  # noqa: SLF001
+
+    with pytest.raises(TimeoutError, match="output waiter did not stop"):
+        await session.pty_terminate(1001)
+
+    assert session._pty_processes[1001] is entry  # noqa: SLF001
+    assert entry.termination_pending
+    with pytest.raises(PtySessionNotFoundError):
+        await session.pty_write_stdin(
+            session_id=1001,
+            chars="",
+            yield_time_s=0,
+        )
+
+    release_waiter.set()
+    await entry.wait_task
+    await session.pty_terminate(1001)
+
+
+@pytest.mark.asyncio
+async def test_e2b_pty_start_rejects_capacity_full_of_terminating_sessions() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    session._pty_processes = {  # noqa: SLF001
+        process_id: e2b_module._E2BPtyProcessEntry(  # noqa: SLF001
+            handle=_FakeE2BPtyHandle(),
+            tty=True,
+            termination_pending=True,
+        )
+        for process_id in range(1_000, 1_064)
+    }
+    session._reserved_pty_process_ids = set(session._pty_processes)  # noqa: SLF001
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+
+    assert "PTY process limit reached" in str(exc_info.value.__cause__)
+    assert len(session._pty_processes) == 64  # noqa: SLF001
+    assert sandbox.pty.handle.kill_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_e2b_pty_start_non_tty_uses_commands_run_in_background() -> None:
     sandbox = _FakeE2BSandbox()
     sandbox.commands.async_command_stdout_chunks = ["started\n"]
@@ -2184,7 +2484,7 @@ async def test_e2b_stop_terminates_live_pty_sessions() -> None:
 
     await session.stop()
 
-    assert sandbox.pty.handle.exit_code == 0
+    assert sandbox.pty.handle.kill_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2294,7 +2594,7 @@ async def test_e2b_pty_start_cleans_up_partially_created_session_on_failure() ->
     with pytest.raises(ExecTransportError):
         await session.pty_exec_start("python3", shell=False, tty=True)
 
-    assert sandbox.pty.handle.exit_code == 0
+    assert sandbox.pty.handle.kill_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2313,7 +2613,7 @@ async def test_e2b_pty_start_cleans_up_partially_created_session_on_cancellation
     with pytest.raises(asyncio.CancelledError):
         await session.pty_exec_start("python3", shell=False, tty=True)
 
-    assert sandbox.pty.handle.exit_code == 0
+    assert sandbox.pty.handle.kill_calls == 1
     assert session._pty_processes == {}  # noqa: SLF001
 
 
