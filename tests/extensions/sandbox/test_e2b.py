@@ -2164,6 +2164,44 @@ async def test_e2b_concurrent_targeted_termination_kills_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_e2b_targeted_termination_racing_global_cleanup_kills_once() -> None:
+    sandbox = _FakeE2BSandbox()
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = E2BSandboxSession.from_state(state, sandbox=sandbox)
+    started = await session.pty_exec_start(
+        "sleep 30",
+        shell=False,
+        tty=True,
+        yield_time_s=0,
+    )
+    assert started.process_id is not None
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+
+    async def block_kill() -> None:
+        kill_started.set()
+        await release_kill.wait()
+
+    sandbox.pty.handle.kill_hook = block_kill
+    global_cleanup = asyncio.create_task(session.pty_terminate_all())
+    await kill_started.wait()
+    targeted = asyncio.create_task(session.pty_terminate(started.process_id))
+    await asyncio.sleep(0)
+    release_kill.set()
+
+    await global_cleanup
+    with pytest.raises(PtySessionNotFoundError):
+        await targeted
+    assert sandbox.pty.handle.kill_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_e2b_cancelled_targeted_termination_preserves_terminal_output() -> None:
     sandbox = _FakeE2BSandbox()
     state = E2BSandboxSessionState(

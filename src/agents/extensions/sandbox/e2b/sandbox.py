@@ -1161,11 +1161,11 @@ class E2BSandboxSession(BaseSandboxSession):
                     if self._pty_processes.get(process_id) is not entry:
                         continue
                     entry.termination_pending = True
-            await self._terminate_pty_entry(entry)
-            async with self._pty_lock:
-                if self._pty_processes.get(process_id) is entry:
-                    self._pty_processes.pop(process_id)
-                    self._reserved_pty_process_ids.discard(process_id)
+                await self._terminate_pty_entry(entry)
+                async with self._pty_lock:
+                    if self._pty_processes.get(process_id) is entry:
+                        self._pty_processes.pop(process_id)
+                        self._reserved_pty_process_ids.discard(process_id)
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:

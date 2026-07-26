@@ -1807,6 +1807,41 @@ class TestDaytonaSandbox:
         ]
 
     @pytest.mark.asyncio
+    async def test_targeted_termination_racing_global_cleanup_kills_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        sandbox.process.kill_pty_session_release = asyncio.Event()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        started = await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            yield_time_s=0,
+        )
+        assert started.process_id is not None
+
+        global_cleanup = asyncio.create_task(session.pty_terminate_all())
+        await sandbox.process.kill_pty_session_started.wait()
+        targeted = asyncio.create_task(session.pty_terminate(started.process_id))
+        await asyncio.sleep(0)
+        sandbox.process.kill_pty_session_release.set()
+
+        await global_cleanup
+        with pytest.raises(PtySessionNotFoundError):
+            await targeted
+        assert sandbox.process.kill_pty_session_calls == [
+            next(iter(sandbox.process._pty_handles))
+        ]
+
+    @pytest.mark.asyncio
     async def test_cancelled_targeted_termination_preserves_terminal_output(
         self,
         monkeypatch: pytest.MonkeyPatch,

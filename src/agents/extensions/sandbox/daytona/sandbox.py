@@ -935,11 +935,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     if self._pty_sessions.get(process_id) is not entry:
                         continue
                     entry.termination_pending = True
-            await self._terminate_pty_entry(entry)
-            async with self._pty_lock:
-                if self._pty_sessions.get(process_id) is entry:
-                    self._pty_sessions.pop(process_id)
-                    self._reserved_pty_process_ids.discard(process_id)
+                await self._terminate_pty_entry(entry)
+                async with self._pty_lock:
+                    if self._pty_sessions.get(process_id) is entry:
+                        self._pty_sessions.pop(process_id)
+                        self._reserved_pty_process_ids.discard(process_id)
 
     async def _collect_pty_output(
         self,
