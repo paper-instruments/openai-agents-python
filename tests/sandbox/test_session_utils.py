@@ -75,6 +75,33 @@ def test_safe_decode_truncates_and_appends_ellipsis() -> None:
     assert _safe_decode(b"abcdef", max_chars=3) == "abc…"
 
 
+@pytest.mark.asyncio
+async def test_shutdown_tears_down_backend_when_process_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _CaptureExecSession()
+    events: list[str] = []
+
+    async def fail_before_shutdown() -> None:
+        events.append("before")
+        raise RuntimeError("process cleanup failed")
+
+    async def shutdown_backend() -> None:
+        events.append("backend")
+
+    async def after_shutdown() -> None:
+        events.append("after")
+
+    monkeypatch.setattr(session, "_before_shutdown", fail_before_shutdown)
+    monkeypatch.setattr(session, "_shutdown_backend", shutdown_backend)
+    monkeypatch.setattr(session, "_after_shutdown", after_shutdown)
+
+    with pytest.raises(RuntimeError, match="process cleanup failed"):
+        await BaseSandboxSession.shutdown(session)
+
+    assert events == ["before", "backend", "after"]
+
+
 def test_best_effort_stream_len_tracks_remaining_bytes_for_seekable_streams() -> None:
     buffer = io.BytesIO(b"hello")
     assert _best_effort_stream_len(buffer) == 5

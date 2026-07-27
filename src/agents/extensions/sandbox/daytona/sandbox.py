@@ -19,6 +19,7 @@ import shlex
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -44,6 +45,7 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_lifecycle import await_task_ignoring_cancellation
 from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
@@ -76,6 +78,8 @@ from ....sandbox.workspace_paths import (
 
 DEFAULT_DAYTONA_WORKSPACE_ROOT = "/home/daytona/workspace"
 logger = logging.getLogger(__name__)
+_DAYTONA_LATE_CREATE_RETRIES = 10
+_DAYTONA_LATE_CREATE_RETRY_S = 0.1
 
 
 # Daytona documents SDK error subclasses plus `status_code` and `error_code` fields at:
@@ -400,6 +404,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
     state: DaytonaSandboxSessionState
     _sandbox: Any
+    _pty_launch_lock: asyncio.Lock
     _pty_lock: asyncio.Lock
     _pty_sessions: dict[int, _DaytonaPtySessionEntry]
     _reserved_pty_process_ids: set[int]
@@ -407,6 +412,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
     def __init__(self, *, state: DaytonaSandboxSessionState, sandbox: Any) -> None:
         self.state = state
         self._sandbox = sandbox
+        self._pty_launch_lock = asyncio.Lock()
         self._pty_lock = asyncio.Lock()
         self._pty_sessions = {}
         self._reserved_pty_process_ids = set()
@@ -662,57 +668,14 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 entry.output_chunks.append(raw)
             entry.output_notify.set()
 
-        pruned: _DaytonaPtySessionEntry | None = None
+        pruned: tuple[int, _DaytonaPtySessionEntry] | None = None
+        process_id = 0
+        process_count = 0
         registered = False
-        try:
-            if tty:
-                pty_handle = await asyncio.wait_for(
-                    self._sandbox.process.create_pty_session(
-                        id=daytona_session_id,
-                        on_data=_on_data,
-                        cwd=cwd,
-                        envs=envs or None,
-                        pty_size=PtySize(cols=80, rows=24),
-                    ),
-                    timeout=exec_timeout,
-                )
-                entry.pty_handle = pty_handle
-                entry.worker_task = asyncio.create_task(self._run_pty_waiter(entry))
-                await asyncio.wait_for(pty_handle.wait_for_connection(), timeout=exec_timeout)
-                await asyncio.wait_for(
-                    pty_handle.send_input(cmd_str + "\n"),
-                    timeout=self.state.timeouts.fast_op_s,
-                )
-            else:
-                SessionExecuteRequest = _import_session_execute_request()
-                env_args = (
-                    " ".join(shlex.quote(f"{key}={value}") for key, value in envs.items())
-                    if envs
-                    else ""
-                )
-                env_wrapper = f"env -- {env_args} " if env_args else ""
-                session_cmd = f"cd {shlex.quote(cwd)} && {env_wrapper}{cmd_str}"
-                await asyncio.wait_for(
-                    self._sandbox.process.create_session(daytona_session_id),
-                    timeout=exec_timeout,
-                )
-                resp = await asyncio.wait_for(
-                    self._sandbox.process.execute_session_command(
-                        daytona_session_id,
-                        SessionExecuteRequest(command=session_cmd, run_async=True),
-                    ),
-                    timeout=exec_timeout,
-                )
-                entry.cmd_id = resp.cmd_id
-                entry.worker_task = asyncio.create_task(
-                    self._run_session_reader(
-                        entry,
-                        daytona_session_id,
-                        resp.cmd_id,
-                        _on_data,
-                    )
-                )
+        launch_timeout = min(exec_timeout, float(self.state.timeouts.fast_op_s))
 
+        async def _register() -> None:
+            nonlocal pruned, process_count, process_id, registered
             async with self._pty_lock:
                 process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
                 self._reserved_pty_process_ids.add(process_id)
@@ -722,59 +685,123 @@ class DaytonaSandboxSession(BaseSandboxSession):
                     raise RuntimeError(
                         "PTY process limit reached while all registered sessions are terminating"
                     )
+            if pruned is not None:
+                await self._retire_registered_pty_entry(
+                    process_id=pruned[0],
+                    entry=pruned[1],
+                )
+            async with self._pty_lock:
                 self._pty_sessions[process_id] = entry
                 process_count = len(self._pty_sessions)
                 registered = True
-        except asyncio.TimeoutError as e:
-            if not registered:
-                cleanup_task = asyncio.ensure_future(self._terminate_pty_entry(entry))
+
+        async def _launch() -> None:
+            async with self._pty_launch_lock:
+                await entry.operation_lock.acquire()
                 try:
-                    await asyncio.shield(cleanup_task)
-                except BaseException:
-                    await asyncio.shield(cleanup_task)
-            raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
-        except Exception as e:
-            if not registered:
-                cleanup_task = asyncio.ensure_future(self._terminate_pty_entry(entry))
-                try:
-                    await asyncio.shield(cleanup_task)
-                except BaseException:
-                    await asyncio.shield(cleanup_task)
-            if timeout_error_types and isinstance(e, timeout_error_types):
-                raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
-            raise _daytona_exec_transport_error(command=command, cause=e) from e
+                    await _register()
+                    if tty:
+                        pty_handle = await asyncio.wait_for(
+                            self._sandbox.process.create_pty_session(
+                                id=daytona_session_id,
+                                on_data=_on_data,
+                                cwd=cwd,
+                                envs=envs or None,
+                                pty_size=PtySize(cols=80, rows=24),
+                            ),
+                            timeout=launch_timeout,
+                        )
+                        entry.pty_handle = pty_handle
+                        entry.worker_task = asyncio.create_task(self._run_pty_waiter(entry))
+                        await asyncio.wait_for(
+                            pty_handle.wait_for_connection(),
+                            timeout=launch_timeout,
+                        )
+                        await asyncio.wait_for(
+                            pty_handle.send_input(cmd_str + "\n"),
+                            timeout=launch_timeout,
+                        )
+                    else:
+                        SessionExecuteRequest = _import_session_execute_request()
+                        env_args = (
+                            " ".join(shlex.quote(f"{key}={value}") for key, value in envs.items())
+                            if envs
+                            else ""
+                        )
+                        env_wrapper = f"env -- {env_args} " if env_args else ""
+                        session_cmd = f"cd {shlex.quote(cwd)} && {env_wrapper}{cmd_str}"
+                        await asyncio.wait_for(
+                            self._sandbox.process.create_session(daytona_session_id),
+                            timeout=launch_timeout,
+                        )
+                        resp = await asyncio.wait_for(
+                            self._sandbox.process.execute_session_command(
+                                daytona_session_id,
+                                SessionExecuteRequest(command=session_cmd, run_async=True),
+                            ),
+                            timeout=launch_timeout,
+                        )
+                        entry.cmd_id = resp.cmd_id
+                        entry.worker_task = asyncio.create_task(
+                            self._run_session_reader(
+                                entry,
+                                daytona_session_id,
+                                resp.cmd_id,
+                                _on_data,
+                            )
+                        )
+                finally:
+                    entry.operation_lock.release()
+
+        launch_task = asyncio.create_task(_launch())
+        try:
+            await asyncio.shield(launch_task)
+        except BaseException as error:
+            await self._finish_unreturned_launch(
+                launch_task=launch_task,
+                entry=entry,
+                registration=lambda: (registered, process_id),
+            )
+            if pruned is not None:
+                await await_task_ignoring_cancellation(
+                    asyncio.create_task(self._cancel_pty_prune(pruned))
+                )
+            if not registered and process_id:
+                async with self._pty_lock:
+                    self._reserved_pty_process_ids.discard(process_id)
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if isinstance(error, asyncio.TimeoutError):
+                raise ExecTimeoutError(command=command, timeout_s=timeout, cause=error) from error
+            if not isinstance(error, Exception):
+                raise
+            if timeout_error_types and isinstance(error, timeout_error_types):
+                raise ExecTimeoutError(command=command, timeout_s=timeout, cause=error) from error
+            raise _daytona_exec_transport_error(command=command, cause=error) from error
+
+        try:
+            if process_count >= PTY_PROCESSES_WARNING:
+                logger.warning(
+                    "PTY process count reached warning threshold: %s active sessions",
+                    process_count,
+                )
+
+            async with entry.output_poll_lock:
+                yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                    max_output_tokens=max_output_tokens,
+                )
+                return await self._finalize_pty_update(
+                    process_id=process_id,
+                    entry=entry,
+                    output=output,
+                    original_token_count=original_token_count,
+                )
         except BaseException:
-            if not registered:
-                cleanup_task = asyncio.ensure_future(self._terminate_pty_entry(entry))
-                try:
-                    await asyncio.shield(cleanup_task)
-                except BaseException:
-                    await asyncio.shield(cleanup_task)
+            await self._finish_unreturned_registered_entry(process_id=process_id, entry=entry)
             raise
-
-        if pruned is not None:
-            async with pruned.operation_lock:
-                await self._terminate_pty_entry(pruned)
-
-        if process_count >= PTY_PROCESSES_WARNING:
-            logger.warning(
-                "PTY process count reached warning threshold: %s active sessions",
-                process_count,
-            )
-
-        async with entry.output_poll_lock:
-            yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-            output, original_token_count = await self._collect_pty_output(
-                entry=entry,
-                yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-                max_output_tokens=max_output_tokens,
-            )
-            return await self._finalize_pty_update(
-                process_id=process_id,
-                entry=entry,
-                output=output,
-                original_token_count=original_token_count,
-            )
 
     async def _run_pty_waiter(self, entry: _DaytonaPtySessionEntry) -> None:
         try:
@@ -877,10 +904,19 @@ class DaytonaSandboxSession(BaseSandboxSession):
 
         if entry.done and not entry.termination_pending:
             async with self._pty_lock:
-                removed = self._pty_sessions.pop(process_id, None)
-                self._reserved_pty_process_ids.discard(process_id)
-            if removed is not None:
-                await self._terminate_pty_entry(removed)
+                if self._pty_sessions.get(process_id) is not entry:
+                    return PtyExecUpdate(
+                        process_id=None,
+                        output=output,
+                        exit_code=exit_code,
+                        original_token_count=original_token_count,
+                    )
+                entry.termination_pending = True
+            await self._terminate_pty_entry(entry, best_effort=False)
+            async with self._pty_lock:
+                if self._pty_sessions.get(process_id) is entry:
+                    self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
             live_process_id = None
         else:
             async with self._pty_lock:
@@ -901,24 +937,52 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
+        retirement_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=session_id, entry=entry)
+        )
+        try:
+            return await asyncio.shield(retirement_task)
+        except asyncio.CancelledError:
+            try:
+                await await_task_ignoring_cancellation(retirement_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Daytona targeted PTY cleanup failed after caller cancellation.",
+                    extra={"process_id": session_id},
+                    exc_info=cleanup_error,
+                )
+            raise
+
+    async def _retire_registered_pty_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _DaytonaPtySessionEntry,
+        reconcile_late_create: bool = False,
+    ) -> PtyExecUpdate:
         async with entry.operation_lock:
             async with self._pty_lock:
-                if self._pty_sessions.get(session_id) is not entry:
-                    raise PtySessionNotFoundError(session_id=session_id)
+                if self._pty_sessions.get(process_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=process_id)
                 entry.termination_pending = True
 
-            await self._terminate_pty_entry(entry, best_effort=False)
+            await self._terminate_pty_entry(
+                entry,
+                best_effort=False,
+                reconcile_late_create=reconcile_late_create,
+            )
             async with entry.output_poll_lock:
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=0,
+                    max_output_tokens=None,
+                )
                 async with self._pty_lock:
-                    if self._pty_sessions.get(session_id) is not entry:
-                        raise PtySessionNotFoundError(session_id=session_id)
-                    output, original_token_count = await self._collect_pty_output(
-                        entry=entry,
-                        yield_time_ms=0,
-                        max_output_tokens=None,
-                    )
-                    self._pty_sessions.pop(session_id)
-                    self._reserved_pty_process_ids.discard(session_id)
+                    if self._pty_sessions.get(process_id) is not entry:
+                        raise PtySessionNotFoundError(session_id=process_id)
+                    self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
+
         return PtyExecUpdate(
             process_id=None,
             output=output,
@@ -926,20 +990,82 @@ class DaytonaSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
+    async def _finish_unreturned_launch(
+        self,
+        *,
+        launch_task: asyncio.Task[None],
+        entry: _DaytonaPtySessionEntry,
+        registration: Callable[[], tuple[bool, int]],
+    ) -> None:
+        if not launch_task.done():
+            try:
+                await await_task_ignoring_cancellation(launch_task)
+            except BaseException:
+                pass
+
+        registered, process_id = registration()
+        if not registered:
+            return
+        await self._finish_unreturned_registered_entry(
+            process_id=process_id,
+            entry=entry,
+        )
+
+    async def _finish_unreturned_registered_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _DaytonaPtySessionEntry,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._retire_registered_pty_entry(
+                process_id=process_id,
+                entry=entry,
+                reconcile_late_create=True,
+            )
+        )
+        try:
+            await await_task_ignoring_cancellation(cleanup_task)
+        except BaseException as cleanup_error:
+            logger.warning(
+                "Daytona PTY cleanup failed before its process ID was returned.",
+                extra={"process_id": process_id},
+                exc_info=cleanup_error,
+            )
+
     async def pty_terminate_all(self) -> None:
-        async with self._pty_lock:
-            entries = list(self._pty_sessions.items())
-        for process_id, entry in entries:
-            async with entry.operation_lock:
-                async with self._pty_lock:
-                    if self._pty_sessions.get(process_id) is not entry:
-                        continue
-                    entry.termination_pending = True
-                await self._terminate_pty_entry(entry)
-                async with self._pty_lock:
-                    if self._pty_sessions.get(process_id) is entry:
-                        self._pty_sessions.pop(process_id)
-                        self._reserved_pty_process_ids.discard(process_id)
+        cleanup_task = asyncio.create_task(self._terminate_all_pty_entries())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await await_task_ignoring_cancellation(cleanup_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Daytona PTY cleanup failed after caller cancellation.",
+                    exc_info=cleanup_error,
+                )
+            raise cancellation
+
+    async def _terminate_all_pty_entries(self) -> None:
+        async with self._pty_launch_lock:
+            async with self._pty_lock:
+                entries = list(self._pty_sessions.items())
+            first_error: Exception | None = None
+            for process_id, entry in entries:
+                try:
+                    await self._retire_registered_pty_entry(process_id=process_id, entry=entry)
+                except PtySessionNotFoundError:
+                    continue
+                except Exception as error:
+                    first_error = first_error or error
+                    logger.warning(
+                        "Failed to terminate Daytona PTY process during session cleanup.",
+                        extra={"process_id": process_id},
+                        exc_info=error,
+                    )
+            if first_error is not None:
+                raise first_error
 
     async def _collect_pty_output(
         self,
@@ -957,7 +1083,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
             max_output_tokens=max_output_tokens,
         )
 
-    def _prune_pty_sessions_if_needed(self) -> _DaytonaPtySessionEntry | None:
+    def _prune_pty_sessions_if_needed(
+        self,
+    ) -> tuple[int, _DaytonaPtySessionEntry] | None:
         if len(self._pty_sessions) < PTY_PROCESSES_MAX:
             return None
         meta: list[tuple[int, float, bool]] = [
@@ -968,30 +1096,53 @@ class DaytonaSandboxSession(BaseSandboxSession):
         pid = process_id_to_prune_from_meta(meta)
         if pid is None:
             return None
-        self._reserved_pty_process_ids.discard(pid)
-        return self._pty_sessions.pop(pid, None)
+        entry = self._pty_sessions[pid]
+        entry.termination_pending = True
+        return pid, entry
+
+    async def _cancel_pty_prune(
+        self,
+        pruned: tuple[int, _DaytonaPtySessionEntry],
+    ) -> None:
+        process_id, entry = pruned
+        async with self._pty_lock:
+            if self._pty_sessions.get(process_id) is entry:
+                entry.termination_pending = False
 
     async def _terminate_pty_entry(
         self,
         entry: _DaytonaPtySessionEntry,
         *,
         best_effort: bool = True,
+        reconcile_late_create: bool = False,
     ) -> None:
-        try:
-            if entry.tty:
-                await self._sandbox.process.kill_pty_session(entry.daytona_session_id)
+        attempts = _DAYTONA_LATE_CREATE_RETRIES if reconcile_late_create else 1
+        for attempt in range(attempts):
+            try:
+                if entry.tty:
+                    await asyncio.wait_for(
+                        self._sandbox.process.kill_pty_session(entry.daytona_session_id),
+                        timeout=self.state.timeouts.cleanup_s,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self._sandbox.process.delete_session(entry.daytona_session_id),
+                        timeout=self.state.timeouts.cleanup_s,
+                    )
+            except Exception as error:
+                not_found_error_types = _daytona_not_found_error_types()
+                if not_found_error_types and isinstance(error, not_found_error_types):
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(_DAYTONA_LATE_CREATE_RETRY_S)
+                        continue
+                    await self._quiesce_pty_worker(entry, best_effort=best_effort)
+                    return
+                if not best_effort:
+                    raise
             else:
-                await self._sandbox.process.delete_session(entry.daytona_session_id)
-        except Exception as error:
-            not_found_error_types = _daytona_not_found_error_types()
-            if not_found_error_types and isinstance(error, not_found_error_types):
                 await self._quiesce_pty_worker(entry, best_effort=best_effort)
                 return
-            if not best_effort:
-                raise
-        else:
-            await self._quiesce_pty_worker(entry, best_effort=best_effort)
-            return
+            break
 
         await self._quiesce_pty_worker(entry, best_effort=True)
 

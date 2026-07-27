@@ -52,6 +52,7 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_lifecycle import await_task_ignoring_cancellation
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -86,6 +87,121 @@ _WORKSPACE_PERSISTENCE_SNAPSHOT: WorkspacePersistenceMode = "snapshot"
 # Magic prefix for native E2B snapshot payloads that cannot be represented as tar bytes.
 _E2B_SANDBOX_SNAPSHOT_MAGIC = b"E2B_SANDBOX_SNAPSHOT_V1\n"
 logger = logging.getLogger(__name__)
+_E2B_MANAGED_PROCESS_TOKEN_ENV = "OPENAI_AGENTS_MANAGED_PROCESS_TOKEN"
+_E2B_PROCESS_GROUP_MAX_START_POLLS = 20
+_E2B_PROCESS_GROUP_TERM_POLLS = 10
+_E2B_PROCESS_GROUP_TERM_POLL_S = 0.05
+
+_E2B_PROCESS_SUPERVISOR = """
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+def keep_supervisor_alive(_signum, _frame):
+    pass
+
+
+def group_has_other_members():
+    own_pid = os.getpid()
+    own_group = os.getpgrp()
+    for item in os.scandir("/proc"):
+        if not item.name.isdigit() or int(item.name) == own_pid:
+            continue
+        try:
+            with open(f"/proc/{item.name}/stat", encoding="utf-8") as stream:
+                stat = stream.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            if int(fields[2]) == own_group:
+                return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            continue
+    return False
+
+
+signal.signal(signal.SIGTERM, keep_supervisor_alive)
+process = subprocess.Popen(sys.argv[1:])
+status = process.wait()
+while group_has_other_members():
+    time.sleep(0.05)
+raise SystemExit(128 - status if status < 0 else status)
+"""
+
+_E2B_PROCESS_GROUP_TERMINATOR = f"""
+import os
+import signal
+import sys
+import time
+
+needle = {_E2B_MANAGED_PROCESS_TOKEN_ENV!r}.encode() + b"=" + sys.argv[1].encode()
+
+
+def managed_groups():
+    groups = set()
+    for item in os.scandir("/proc"):
+        if not item.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{{item.name}}/environ", "rb") as stream:
+                if needle not in stream.read().split(b"\\0"):
+                    continue
+            with open(f"/proc/{{item.name}}/stat", encoding="utf-8") as stream:
+                stat = stream.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            pgid = int(fields[2])
+            if pgid > 1:
+                groups.add(pgid)
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            continue
+    return groups
+
+
+def signal_groups(groups, sig):
+    for pgid in groups:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+
+
+groups = set()
+start_polls = int(sys.argv[2])
+for attempt in range(start_polls):
+    groups = managed_groups()
+    if groups:
+        break
+    if attempt + 1 < start_polls:
+        time.sleep({_E2B_PROCESS_GROUP_TERM_POLL_S})
+
+if groups:
+    signal_groups(groups, signal.SIGTERM)
+    for _ in range({_E2B_PROCESS_GROUP_TERM_POLLS}):
+        groups = managed_groups()
+        if not groups:
+            break
+        time.sleep({_E2B_PROCESS_GROUP_TERM_POLL_S})
+    else:
+        signal_groups(managed_groups(), signal.SIGKILL)
+"""
+
+
+def _e2b_process_group_termination_command(
+    process_token: str,
+    *,
+    start_polls: int,
+) -> str:
+    return shlex.join(
+        ("python3", "-c", _E2B_PROCESS_GROUP_TERMINATOR, process_token, str(start_polls))
+    )
+
+
+def _e2b_supervised_command(command: Sequence[str | Path]) -> str:
+    return shlex.join(
+        ("exec", "setsid", "--", "python3", "-c", _E2B_PROCESS_SUPERVISOR)
+        + tuple(str(part) for part in command)
+    )
 
 
 # E2B documents SDK exception classes at:
@@ -150,7 +266,7 @@ def _raise_e2b_exec_error(
         ) from exc
 
     # E2B timeout or httpcore read timeout.
-    is_timeout = exception_chain_contains_type(exc, timeout_error_types)
+    is_timeout = exception_chain_contains_type(exc, (*timeout_error_types, TimeoutError))
     if not is_timeout and any(
         type(c).__name__ == "ReadTimeout" and type(c).__module__.startswith("httpcore")
         for c in chain
@@ -683,6 +799,7 @@ class E2BSandboxSessionState(SandboxSessionState):
 class _E2BPtyProcessEntry:
     handle: object
     tty: bool
+    process_token: str | None = None
     operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     termination_pending: bool = False
@@ -707,9 +824,11 @@ class E2BSandboxSession(BaseSandboxSession):
     _sandbox: _E2BSandboxAPI
     _workspace_root_ready: bool
     _skip_next_workspace_root_mkdir: bool
+    _pty_launch_lock: asyncio.Lock
     _pty_lock: asyncio.Lock
     _pty_processes: dict[int, _E2BPtyProcessEntry]
     _reserved_pty_process_ids: set[int]
+    _force_kill_on_shutdown: bool
 
     def __init__(
         self,
@@ -721,9 +840,11 @@ class E2BSandboxSession(BaseSandboxSession):
         self._sandbox = _as_sandbox_api(sandbox)
         self._workspace_root_ready = state.workspace_root_ready
         self._skip_next_workspace_root_mkdir = False
+        self._pty_launch_lock = asyncio.Lock()
         self._pty_lock = asyncio.Lock()
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
+        self._force_kill_on_shutdown = False
 
     @classmethod
     def from_state(
@@ -860,15 +981,30 @@ class E2BSandboxSession(BaseSandboxSession):
     async def _after_start_failed(self) -> None:
         self._skip_next_workspace_root_mkdir = False
 
+    async def _before_stop(self) -> None:
+        try:
+            await super()._before_stop()
+        except BaseException:
+            self._force_kill_on_shutdown = True
+            raise
+
+    async def _before_shutdown(self) -> None:
+        try:
+            await super()._before_shutdown()
+        except BaseException:
+            self._force_kill_on_shutdown = True
+            raise
+
     async def _shutdown_backend(self) -> None:
         # Best-effort kill of the remote sandbox.
+        should_pause = self.state.pause_on_exit and not self._force_kill_on_shutdown
         try:
-            if self.state.pause_on_exit:
+            if should_pause:
                 await _sandbox_pause(self._sandbox)
             else:
                 await _sandbox_kill(self._sandbox)
         except Exception as e:
-            if self.state.pause_on_exit:
+            if should_pause:
                 logger.warning(
                     "Failed to pause E2B sandbox on shutdown; falling back to kill.",
                     extra={
@@ -971,7 +1107,12 @@ class E2BSandboxSession(BaseSandboxSession):
         exec_timeout = self._coerce_exec_timeout(timeout)
         timeout_error_types = _e2b_timeout_error_types()
 
-        entry = _E2BPtyProcessEntry(handle=None, tty=tty)
+        process_token = uuid.uuid4().hex
+        entry = _E2BPtyProcessEntry(
+            handle=None,
+            tty=tty,
+            process_token=process_token,
+        )
 
         async def _append_output(payload: bytes | bytearray | str | object) -> None:
             if isinstance(payload, bytes):
@@ -988,88 +1129,136 @@ class E2BSandboxSession(BaseSandboxSession):
             entry.output_notify.set()
 
         registered = False
-        pruned_entry: _E2BPtyProcessEntry | None = None
+        pruned_entry: tuple[int, _E2BPtyProcessEntry] | None = None
         process_id = 0
         process_count = 0
-        try:
-            if tty:
-                handle = await self._sandbox.pty.create(
-                    size=_E2BPtySize(rows=24, cols=80),
-                    cwd=cwd,
-                    envs=envs,
-                    timeout=exec_timeout,
-                    on_data=_append_output,
-                )
-                entry.handle = handle
-                await self._sandbox.pty.send_stdin(
-                    cast(Any, handle).pid,
-                    f"{command_text}\n".encode(),
-                    request_timeout=self.state.timeouts.fast_op_s,
-                )
-            else:
-                handle = await self._sandbox.commands.run(
-                    command_text,
-                    background=True,
-                    cwd=cwd,
-                    envs=envs,
-                    timeout=exec_timeout,
-                    stdin=False,
-                    on_stdout=_append_output,
-                    on_stderr=_append_output,
-                )
-                entry.handle = handle
-            entry.wait_task = asyncio.create_task(self._run_pty_waiter(entry))
-            async with self._pty_lock:
-                process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
-                self._reserved_pty_process_ids.add(process_id)
-                pruned_entry = self._prune_pty_processes_if_needed()
-                if len(self._pty_processes) >= PTY_PROCESSES_MAX and pruned_entry is None:
-                    self._reserved_pty_process_ids.discard(process_id)
-                    raise RuntimeError(
-                        "PTY process limit reached while all registered sessions are terminating"
+        provider_launch_attempted = False
+
+        async def _launch() -> None:
+            nonlocal process_count, process_id, provider_launch_attempted
+            nonlocal pruned_entry, registered
+            async with self._pty_launch_lock:
+                async with self._pty_lock:
+                    process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+                    self._reserved_pty_process_ids.add(process_id)
+                    pruned_entry = self._prune_pty_processes_if_needed()
+                    if len(self._pty_processes) >= PTY_PROCESSES_MAX and pruned_entry is None:
+                        self._reserved_pty_process_ids.discard(process_id)
+                        raise RuntimeError(
+                            "PTY process limit reached while all registered sessions "
+                            "are terminating"
+                        )
+                if pruned_entry is not None:
+                    await self._retire_registered_pty_entry(
+                        process_id=pruned_entry[0],
+                        entry=pruned_entry[1],
                     )
-                self._pty_processes[process_id] = entry
-                process_count = len(self._pty_processes)
-                registered = True
-        except asyncio.CancelledError:
-            if not registered and entry.handle is not None:
-                await self._terminate_pty_entry(entry)
-            raise
-        except Exception as e:
-            if not registered and entry.handle is not None:
-                await self._terminate_pty_entry(entry)
-            if isinstance(e, ExecTransportError):
+
+                if tty:
+                    launch_envs = {
+                        **envs,
+                        _E2B_MANAGED_PROCESS_TOKEN_ENV: process_token,
+                    }
+                    provider_launch_attempted = True
+                    handle = await asyncio.wait_for(
+                        self._sandbox.pty.create(
+                            size=_E2BPtySize(rows=24, cols=80),
+                            cwd=cwd,
+                            envs=launch_envs,
+                            timeout=exec_timeout,
+                            on_data=_append_output,
+                        ),
+                        timeout=self.state.timeouts.fast_op_s,
+                    )
+                    entry.handle = handle
+                    entry.wait_task = asyncio.create_task(self._run_pty_waiter(entry))
+                    await self._sandbox.pty.send_stdin(
+                        cast(Any, handle).pid,
+                        f"{command_text}\n".encode(),
+                        request_timeout=self.state.timeouts.fast_op_s,
+                    )
+                else:
+                    grouped_command_text = _e2b_supervised_command(sanitized_command)
+                    launch_envs = {
+                        **envs,
+                        _E2B_MANAGED_PROCESS_TOKEN_ENV: process_token,
+                    }
+                    provider_launch_attempted = True
+                    handle = await asyncio.wait_for(
+                        self._sandbox.commands.run(
+                            grouped_command_text,
+                            background=True,
+                            cwd=cwd,
+                            envs=launch_envs,
+                            timeout=exec_timeout,
+                            request_timeout=self.state.timeouts.fast_op_s,
+                            stdin=False,
+                            on_stdout=_append_output,
+                            on_stderr=_append_output,
+                        ),
+                        timeout=self.state.timeouts.fast_op_s,
+                    )
+                    entry.handle = handle
+                    entry.wait_task = asyncio.create_task(self._run_pty_waiter(entry))
+
+                async with self._pty_lock:
+                    self._pty_processes[process_id] = entry
+                    process_count = len(self._pty_processes)
+                    registered = True
+
+        launch_task = asyncio.create_task(_launch())
+        try:
+            await asyncio.shield(launch_task)
+        except BaseException as error:
+            await self._finish_unreturned_launch(
+                launch_task=launch_task,
+                entry=entry,
+                registration=lambda: (registered, process_id),
+                provider_launch_attempted=lambda: provider_launch_attempted,
+            )
+            if pruned_entry is not None:
+                await await_task_ignoring_cancellation(
+                    asyncio.create_task(self._cancel_pty_prune(pruned_entry))
+                )
+            if not registered and process_id:
+                async with self._pty_lock:
+                    self._reserved_pty_process_ids.discard(process_id)
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, ExecTransportError):
                 raise
             _raise_e2b_exec_error(
-                e,
+                error,
                 command=command,
                 timeout=timeout,
                 timeout_error_types=timeout_error_types,
             )
 
-        if pruned_entry is not None:
-            async with pruned_entry.operation_lock:
-                await self._terminate_pty_entry(pruned_entry)
+        try:
+            if process_count >= PTY_PROCESSES_WARNING:
+                logger.warning(
+                    "PTY process count reached warning threshold: %s active sessions",
+                    process_count,
+                )
 
-        if process_count >= PTY_PROCESSES_WARNING:
-            logger.warning(
-                "PTY process count reached warning threshold: %s active sessions",
-                process_count,
-            )
-
-        async with entry.output_poll_lock:
-            yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-            output, original_token_count = await self._collect_pty_output(
-                entry=entry,
-                yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-                max_output_tokens=max_output_tokens,
-            )
-            return await self._finalize_pty_update(
-                process_id=process_id,
-                entry=entry,
-                output=output,
-                original_token_count=original_token_count,
-            )
+            async with entry.output_poll_lock:
+                yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                    max_output_tokens=max_output_tokens,
+                )
+                return await self._finalize_pty_update(
+                    process_id=process_id,
+                    entry=entry,
+                    output=output,
+                    original_token_count=original_token_count,
+                )
+        except BaseException:
+            await self._finish_unreturned_registered_entry(process_id=process_id, entry=entry)
+            raise
 
     async def pty_write_stdin(
         self,
@@ -1126,24 +1315,47 @@ class E2BSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
+        retirement_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=session_id, entry=entry)
+        )
+        try:
+            return await asyncio.shield(retirement_task)
+        except asyncio.CancelledError:
+            try:
+                await await_task_ignoring_cancellation(retirement_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "E2B targeted PTY cleanup failed after caller cancellation.",
+                    extra={"process_id": session_id},
+                    exc_info=cleanup_error,
+                )
+            raise
+
+    async def _retire_registered_pty_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _E2BPtyProcessEntry,
+    ) -> PtyExecUpdate:
         async with entry.operation_lock:
             async with self._pty_lock:
-                if self._pty_processes.get(session_id) is not entry:
-                    raise PtySessionNotFoundError(session_id=session_id)
+                if self._pty_processes.get(process_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=process_id)
                 entry.termination_pending = True
 
             await self._terminate_pty_entry(entry, best_effort=False)
             async with entry.output_poll_lock:
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=0,
+                    max_output_tokens=None,
+                )
                 async with self._pty_lock:
-                    if self._pty_processes.get(session_id) is not entry:
-                        raise PtySessionNotFoundError(session_id=session_id)
-                    output, original_token_count = await self._collect_pty_output(
-                        entry=entry,
-                        yield_time_ms=0,
-                        max_output_tokens=None,
-                    )
-                    self._pty_processes.pop(session_id)
-                    self._reserved_pty_process_ids.discard(session_id)
+                    if self._pty_processes.get(process_id) is not entry:
+                        raise PtySessionNotFoundError(session_id=process_id)
+                    self._pty_processes.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
+
         return PtyExecUpdate(
             process_id=None,
             output=output,
@@ -1151,21 +1363,107 @@ class E2BSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
-    async def pty_terminate_all(self) -> None:
-        async with self._pty_lock:
-            entries = list(self._pty_processes.items())
+    async def _finish_unreturned_launch(
+        self,
+        *,
+        launch_task: asyncio.Task[None],
+        entry: _E2BPtyProcessEntry,
+        registration: Callable[[], tuple[bool, int]],
+        provider_launch_attempted: Callable[[], bool],
+    ) -> None:
+        if not launch_task.done():
+            try:
+                await await_task_ignoring_cancellation(launch_task)
+            except BaseException:
+                pass
 
-        for process_id, entry in entries:
-            async with entry.operation_lock:
-                async with self._pty_lock:
-                    if self._pty_processes.get(process_id) is not entry:
-                        continue
-                    entry.termination_pending = True
-                await self._terminate_pty_entry(entry)
-                async with self._pty_lock:
-                    if self._pty_processes.get(process_id) is entry:
-                        self._pty_processes.pop(process_id)
-                        self._reserved_pty_process_ids.discard(process_id)
+        registered, process_id = registration()
+        if registered:
+            await self._finish_unreturned_registered_entry(process_id=process_id, entry=entry)
+            return
+        if not provider_launch_attempted():
+            return
+        if entry.handle is None and entry.process_token is None:
+            return
+
+        cleanup_task = asyncio.create_task(
+            self._terminate_pty_entry(
+                entry,
+                best_effort=False,
+                reconcile_late_start=True,
+            )
+        )
+        try:
+            await await_task_ignoring_cancellation(cleanup_task)
+        except BaseException as cleanup_error:
+            retention_task = asyncio.create_task(self._retain_unreturned_pty_entry(entry))
+            process_id = await await_task_ignoring_cancellation(retention_task)
+            logger.warning(
+                "E2B PTY cleanup failed before process registration.",
+                extra={"process_id": process_id},
+                exc_info=cleanup_error,
+            )
+
+    async def _retain_unreturned_pty_entry(self, entry: _E2BPtyProcessEntry) -> int:
+        async with self._pty_lock:
+            process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+            self._reserved_pty_process_ids.add(process_id)
+            entry.termination_pending = True
+            self._pty_processes[process_id] = entry
+            return process_id
+
+    async def _finish_unreturned_registered_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _E2BPtyProcessEntry,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=process_id, entry=entry)
+        )
+        try:
+            await await_task_ignoring_cancellation(cleanup_task)
+        except BaseException as cleanup_error:
+            logger.warning(
+                "E2B PTY cleanup failed before its process ID was returned.",
+                extra={"process_id": process_id},
+                exc_info=cleanup_error,
+            )
+
+    async def pty_terminate_all(self) -> None:
+        cleanup_task = asyncio.create_task(self._terminate_all_pty_entries())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await await_task_ignoring_cancellation(cleanup_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "E2B PTY cleanup failed after caller cancellation.",
+                    exc_info=cleanup_error,
+                )
+            raise cancellation
+
+    async def _terminate_all_pty_entries(self) -> None:
+        async with self._pty_launch_lock:
+            async with self._pty_lock:
+                entries = list(self._pty_processes.items())
+
+            first_error: Exception | None = None
+            for process_id, entry in entries:
+                try:
+                    await self._retire_registered_pty_entry(process_id=process_id, entry=entry)
+                except PtySessionNotFoundError:
+                    continue
+                except Exception as error:
+                    first_error = first_error or error
+                    logger.warning(
+                        "Failed to terminate E2B PTY process during session cleanup.",
+                        extra={"process_id": process_id},
+                        exc_info=error,
+                    )
+            if first_error is not None:
+                raise first_error
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
@@ -1330,10 +1628,19 @@ class E2BSandboxSession(BaseSandboxSession):
 
         if exit_code is not None and not entry.termination_pending:
             async with self._pty_lock:
-                removed = self._pty_processes.pop(process_id, None)
-                self._reserved_pty_process_ids.discard(process_id)
-            if removed is not None:
-                await self._terminate_pty_entry(removed)
+                if self._pty_processes.get(process_id) is not entry:
+                    return PtyExecUpdate(
+                        process_id=None,
+                        output=output,
+                        exit_code=exit_code,
+                        original_token_count=original_token_count,
+                    )
+                entry.termination_pending = True
+            await self._terminate_pty_entry(entry, best_effort=False)
+            async with self._pty_lock:
+                if self._pty_processes.get(process_id) is entry:
+                    self._pty_processes.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
             live_process_id = None
         else:
             async with self._pty_lock:
@@ -1347,7 +1654,9 @@ class E2BSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
-    def _prune_pty_processes_if_needed(self) -> _E2BPtyProcessEntry | None:
+    def _prune_pty_processes_if_needed(
+        self,
+    ) -> tuple[int, _E2BPtyProcessEntry] | None:
         if len(self._pty_processes) < PTY_PROCESSES_MAX:
             return None
 
@@ -1360,8 +1669,18 @@ class E2BSandboxSession(BaseSandboxSession):
         if process_id is None:
             return None
 
-        self._reserved_pty_process_ids.discard(process_id)
-        return self._pty_processes.pop(process_id, None)
+        entry = self._pty_processes[process_id]
+        entry.termination_pending = True
+        return process_id, entry
+
+    async def _cancel_pty_prune(
+        self,
+        pruned: tuple[int, _E2BPtyProcessEntry],
+    ) -> None:
+        process_id, entry = pruned
+        async with self._pty_lock:
+            if self._pty_processes.get(process_id) is entry:
+                entry.termination_pending = False
 
     def _entry_exit_code(self, entry: _E2BPtyProcessEntry) -> int | None:
         value = getattr(entry.handle, "exit_code", None)
@@ -1379,25 +1698,32 @@ class E2BSandboxSession(BaseSandboxSession):
         entry: _E2BPtyProcessEntry,
         *,
         best_effort: bool = True,
+        reconcile_late_start: bool = False,
     ) -> None:
-        if self._entry_exit_code(entry) is not None:
-            if not best_effort:
-                await self._await_pty_waiter(entry)
-            return
-
         wait_task = entry.wait_task
+        termination_error: Exception | None = None
 
-        kill = getattr(entry.handle, "kill", None)
-        if not callable(kill):
-            if not best_effort:
-                raise RuntimeError("E2B PTY handle does not support targeted termination")
-        elif best_effort:
+        if entry.process_token is not None:
             try:
-                await kill()
-            except Exception:
-                pass
-        else:
-            await kill()
+                await self._terminate_e2b_process_group(
+                    entry.process_token,
+                    reconcile_late_start=reconcile_late_start,
+                )
+            except Exception as error:
+                termination_error = error
+
+        should_kill_handle = entry.handle is not None and (
+            (entry.tty and self._entry_exit_code(entry) is None)
+            or (not entry.tty and (entry.process_token is None or termination_error is not None))
+        )
+        if should_kill_handle:
+            try:
+                await self._kill_e2b_handle(entry, best_effort=False)
+            except Exception as error:
+                termination_error = termination_error or error
+
+        if termination_error is not None and not best_effort:
+            raise termination_error
 
         if wait_task is not None:
             if best_effort and not wait_task.done():
@@ -1406,6 +1732,52 @@ class E2BSandboxSession(BaseSandboxSession):
                 await asyncio.gather(wait_task, return_exceptions=True)
             else:
                 await self._await_pty_waiter(entry)
+
+    async def _terminate_e2b_process_group(
+        self,
+        process_token: str,
+        *,
+        reconcile_late_start: bool,
+    ) -> None:
+        start_polls = 1
+        if reconcile_late_start:
+            available_s = min(
+                (_E2B_PROCESS_GROUP_MAX_START_POLLS - 1) * _E2B_PROCESS_GROUP_TERM_POLL_S,
+                max(0.0, self.state.timeouts.cleanup_s - 0.5),
+            )
+            start_polls += int(available_s / _E2B_PROCESS_GROUP_TERM_POLL_S)
+        command = _e2b_process_group_termination_command(
+            process_token,
+            start_polls=start_polls,
+        )
+        await asyncio.wait_for(
+            self._sandbox.commands.run(
+                command,
+                timeout=self.state.timeouts.cleanup_s,
+                request_timeout=self.state.timeouts.cleanup_s,
+                user="root",
+            ),
+            timeout=self.state.timeouts.cleanup_s,
+        )
+
+    async def _kill_e2b_handle(
+        self,
+        entry: _E2BPtyProcessEntry,
+        *,
+        best_effort: bool,
+    ) -> None:
+        kill = getattr(entry.handle, "kill", None)
+        if not callable(kill):
+            if not best_effort:
+                raise RuntimeError("E2B PTY handle does not support targeted termination")
+            return
+        if not best_effort:
+            await kill()
+            return
+        try:
+            await kill()
+        except Exception:
+            pass
 
     async def _await_pty_waiter(self, entry: _E2BPtyProcessEntry) -> None:
         wait_task = entry.wait_task

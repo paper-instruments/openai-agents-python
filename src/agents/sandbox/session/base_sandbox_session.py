@@ -315,9 +315,13 @@ class BaseSandboxSession(abc.ABC):
 
         Default is a no-op. Sandbox-specific sessions (e.g. Docker) should override.
         """
-        await self._before_shutdown()
-        await self._shutdown_backend()
-        await self._after_shutdown()
+        try:
+            await self._before_shutdown()
+        finally:
+            try:
+                await self._shutdown_backend()
+            finally:
+                await self._after_shutdown()
 
     async def _before_shutdown(self) -> None:
         """Run transient process cleanup before backend shutdown."""
@@ -556,6 +560,13 @@ class BaseSandboxSession(abc.ABC):
         yield_time_s: float | None = None,
         max_output_tokens: int | None = None,
     ) -> PtyExecUpdate:
+        """Start one managed process and return its initial output.
+
+        Backends that also implement targeted termination own provider work created by this call
+        until its process ID is returned. They must retire that work on cancellation or another
+        failure before return without affecting sibling processes, and retain retry state if
+        retirement fails.
+        """
         _ = (command, timeout, shell, user, tty, yield_time_s, max_output_tokens)
         raise NotImplementedError("PTY execution is not supported by this sandbox session")
 
@@ -573,10 +584,11 @@ class BaseSandboxSession(abc.ABC):
     async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
         """Terminate one PTY session and return its final unread output.
 
-        Implementations must remove only ``session_id`` from their local registry, terminate the
-        corresponding provider process through the backend's normal cleanup path, and return a
-        terminal update whose ``process_id`` is ``None``. Unknown or already-retired session IDs
-        must raise :class:`PtySessionNotFoundError`.
+        Implementations must terminate only the backend-owned execution represented by
+        ``session_id``, drain final unread output, remove it from their local registry, and return
+        a terminal update whose ``process_id`` is ``None``. Cleanup must be bounded and must not
+        affect sibling sessions. Failed cleanup must leave the entry retryable. Unknown or
+        already-retired session IDs must raise :class:`PtySessionNotFoundError`.
         """
         _ = session_id
         raise NotImplementedError("PTY execution is not supported by this sandbox session")
