@@ -277,7 +277,8 @@ async def test_stream_response_keeps_reasoning_item_open_across_interleaved_text
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
-async def test_get_response_with_reasoning_content(monkeypatch) -> None:
+@pytest.mark.parametrize("reasoning_field", ["reasoning_content", "reasoning"])
+async def test_get_response_with_reasoning_content(monkeypatch, reasoning_field: str) -> None:
     """
     Test that when a model returns reasoning content in addition to regular content,
     `get_response` properly includes both in the response output.
@@ -287,10 +288,9 @@ async def test_get_response_with_reasoning_content(monkeypatch) -> None:
         role="assistant",
         content="The answer is 42",
     )
-    # Use dynamic attribute for reasoning_content
-    # We need to cast to Any to avoid mypy errors since reasoning_content is not a defined attribute
+    # Reasoning fields are provider extensions to ChatCompletionMessage.
     msg_with_reasoning = cast(Any, msg)
-    msg_with_reasoning.reasoning_content = "Let me think about this question carefully"
+    setattr(msg_with_reasoning, reasoning_field, "Let me think about this question carefully")
 
     # create a choice with the message
     mock_choice = {
