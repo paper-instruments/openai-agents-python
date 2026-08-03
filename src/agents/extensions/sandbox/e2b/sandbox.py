@@ -1090,6 +1090,25 @@ class E2BSandboxSession(BaseSandboxSession):
     def supports_pty(self) -> bool:
         return True
 
+    async def _managed_process_command(
+        self,
+        sanitized_command: Sequence[str],
+        *,
+        process_token: str,
+    ) -> list[str]:
+        """Build the argv that will actually be launched for a managed PTY process.
+
+        Default: the command unchanged, i.e. it runs on the sandbox host, where the supervisor
+        and the process-group terminator both operate.
+
+        A session that relocates execution elsewhere — for example into a container via
+        ``docker exec`` — overrides this to build that transport. Such an override must carry
+        ``_E2B_MANAGED_PROCESS_TOKEN_ENV=process_token`` into the environment of the relocated
+        process, because the terminator identifies the process group by scanning ``/proc`` for
+        that variable and can only find it where the process really is.
+        """
+        return [str(part) for part in sanitized_command]
+
     async def pty_exec_start(
         self,
         *command: str | Path,
@@ -1100,14 +1119,20 @@ class E2BSandboxSession(BaseSandboxSession):
         yield_time_s: float | None = None,
         max_output_tokens: int | None = None,
     ) -> PtyExecUpdate:
+        # The token is minted before the command is built so a session that relocates execution
+        # can carry it to wherever the process will actually run; see _managed_process_command.
+        process_token = uuid.uuid4().hex
         sanitized_command = self._prepare_exec_command(*command, shell=shell, user=user)
+        sanitized_command = await self._managed_process_command(
+            sanitized_command,
+            process_token=process_token,
+        )
         command_text = shlex.join(str(part) for part in sanitized_command)
         envs = await self._resolved_envs()
         cwd = self.state.manifest.root if self._workspace_root_ready else None
         exec_timeout = self._coerce_exec_timeout(timeout)
         timeout_error_types = _e2b_timeout_error_types()
 
-        process_token = uuid.uuid4().hex
         entry = _E2BPtyProcessEntry(
             handle=None,
             tty=tty,
