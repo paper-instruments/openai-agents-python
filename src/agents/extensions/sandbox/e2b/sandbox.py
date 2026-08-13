@@ -1661,7 +1661,6 @@ class E2BSandboxSession(BaseSandboxSession):
                         original_token_count=original_token_count,
                     )
                 entry.termination_pending = True
-            await self._terminate_pty_entry(entry, best_effort=False)
             async with self._pty_lock:
                 if self._pty_processes.get(process_id) is entry:
                     self._pty_processes.pop(process_id)

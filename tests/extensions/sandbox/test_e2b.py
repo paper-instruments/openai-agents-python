@@ -2960,7 +2960,9 @@ async def test_e2b_pty_start_non_tty_wakes_when_exit_follows_last_output() -> No
     assert started.output == b"started\n"
     assert handle.wait_calls == 1
     assert handle.kill_calls == 0
-    assert sandbox.commands.group_termination_calls == [handle.pid]
+    assert sandbox.commands.group_termination_calls == []
+    assert session._pty_processes == {}  # noqa: SLF001
+    assert session._reserved_pty_process_ids == set()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -2989,6 +2991,9 @@ async def test_e2b_pty_start_tty_wakes_when_session_exits_after_output() -> None
     assert handle.stdin_payloads == [b"exit\n"]
     assert handle.wait_calls == 1
     assert handle.kill_calls == 0
+    assert sandbox.commands.group_termination_calls == []
+    assert session._pty_processes == {}  # noqa: SLF001
+    assert session._reserved_pty_process_ids == set()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
