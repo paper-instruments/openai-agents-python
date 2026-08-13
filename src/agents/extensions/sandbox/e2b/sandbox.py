@@ -92,7 +92,7 @@ _E2B_PROCESS_GROUP_MAX_START_POLLS = 20
 _E2B_PROCESS_GROUP_TERM_POLLS = 10
 _E2B_PROCESS_GROUP_TERM_POLL_S = 0.05
 
-_E2B_PROCESS_SUPERVISOR = """
+_E2B_PROCESS_SUPERVISOR = f"""
 import os
 import signal
 import subprocess
@@ -104,18 +104,27 @@ def keep_supervisor_alive(_signum, _frame):
     pass
 
 
-def group_has_other_members():
+token = os.environ.get({_E2B_MANAGED_PROCESS_TOKEN_ENV!r}, "").encode()
+needle = {_E2B_MANAGED_PROCESS_TOKEN_ENV!r}.encode() + b"=" + token
+
+
+def owned_process_exists():
     own_pid = os.getpid()
     own_group = os.getpgrp()
     for item in os.scandir("/proc"):
         if not item.name.isdigit() or int(item.name) == own_pid:
             continue
         try:
-            with open(f"/proc/{item.name}/stat", encoding="utf-8") as stream:
+            process_path = f"/proc/{{item.name}}"
+            with open(f"{{process_path}}/stat", encoding="utf-8") as stream:
                 stat = stream.read()
             fields = stat[stat.rfind(")") + 2:].split()
             if int(fields[2]) == own_group:
                 return True
+            if token:
+                with open(f"{{process_path}}/environ", "rb") as stream:
+                    if needle in stream.read().split(b"\\0"):
+                        return True
         except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
             continue
     return False
@@ -124,7 +133,7 @@ def group_has_other_members():
 signal.signal(signal.SIGTERM, keep_supervisor_alive)
 process = subprocess.Popen(sys.argv[1:])
 status = process.wait()
-while group_has_other_members():
+while owned_process_exists():
     time.sleep(0.05)
 raise SystemExit(128 - status if status < 0 else status)
 """
@@ -809,6 +818,13 @@ class _E2BPtyProcessEntry:
     last_used: float = field(default_factory=time.monotonic)
     exit_code: int | None = None
     wait_task: asyncio.Task[None] | None = None
+    completion_tracks_descendants: bool = False
+
+
+@dataclass(frozen=True)
+class _E2BManagedProcessCommand:
+    argv: list[str]
+    completion_tracks_descendants: bool
 
 
 @dataclass(frozen=True)
@@ -1095,7 +1111,7 @@ class E2BSandboxSession(BaseSandboxSession):
         sanitized_command: Sequence[str],
         *,
         process_token: str,
-    ) -> list[str]:
+    ) -> _E2BManagedProcessCommand:
         """Build the argv that will actually be launched for a managed PTY process.
 
         Default: the command unchanged, i.e. it runs on the sandbox host, where the supervisor
@@ -1104,10 +1120,14 @@ class E2BSandboxSession(BaseSandboxSession):
         A session that relocates execution elsewhere — for example into a container via
         ``docker exec`` — overrides this to build that transport. Such an override must carry
         ``_E2B_MANAGED_PROCESS_TOKEN_ENV=process_token`` into the environment of the relocated
-        process, because the terminator identifies the process group by scanning ``/proc`` for
-        that variable and can only find it where the process really is.
+        process. It may set ``completion_tracks_descendants=True`` only when the returned
+        transport cannot complete while token-bearing descendants are still alive in the remote
+        process namespace. Existing overrides returning a bare list retain termination on exit.
         """
-        return [str(part) for part in sanitized_command]
+        return _E2BManagedProcessCommand(
+            argv=[str(part) for part in sanitized_command],
+            completion_tracks_descendants=True,
+        )
 
     async def pty_exec_start(
         self,
@@ -1123,10 +1143,17 @@ class E2BSandboxSession(BaseSandboxSession):
         # can carry it to wherever the process will actually run; see _managed_process_command.
         process_token = uuid.uuid4().hex
         sanitized_command = self._prepare_exec_command(*command, shell=shell, user=user)
-        sanitized_command = await self._managed_process_command(
+        managed_command = await self._managed_process_command(
             sanitized_command,
             process_token=process_token,
         )
+        if isinstance(managed_command, _E2BManagedProcessCommand):
+            sanitized_command = managed_command.argv
+            completion_tracks_descendants = managed_command.completion_tracks_descendants
+        else:
+            # Preserve cleanup safety for existing relocation overrides using the old list return.
+            sanitized_command = managed_command
+            completion_tracks_descendants = False
         command_text = shlex.join(str(part) for part in sanitized_command)
         envs = await self._resolved_envs()
         cwd = self.state.manifest.root if self._workspace_root_ready else None
@@ -1137,6 +1164,7 @@ class E2BSandboxSession(BaseSandboxSession):
             handle=None,
             tty=tty,
             process_token=process_token,
+            completion_tracks_descendants=completion_tracks_descendants and not tty,
         )
 
         async def _append_output(payload: bytes | bytearray | str | object) -> None:
@@ -1661,7 +1689,8 @@ class E2BSandboxSession(BaseSandboxSession):
                         original_token_count=original_token_count,
                     )
                 entry.termination_pending = True
-            await self._terminate_pty_entry(entry, best_effort=False)
+            if not entry.completion_tracks_descendants:
+                await self._terminate_pty_entry(entry, best_effort=False)
             async with self._pty_lock:
                 if self._pty_processes.get(process_id) is entry:
                     self._pty_processes.pop(process_id)
