@@ -113,6 +113,38 @@ def test_e2b_supervisor_retains_ownership_after_direct_child_exits() -> None:
         process.wait(timeout=5)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the E2B supervisor runs on Linux")
+def test_e2b_supervisor_retains_ownership_after_descendant_changes_session() -> None:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            e2b_module._E2B_PROCESS_SUPERVISOR,
+            "sh",
+            "-c",
+            "setsid sleep 30 &",
+        ],
+        env={e2b_module._E2B_MANAGED_PROCESS_TOKEN_ENV: "test-token"},
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.2)
+        assert process.poll() is None
+    finally:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                e2b_module._E2B_PROCESS_GROUP_TERMINATOR,
+                "test-token",
+                "1",
+            ],
+            check=True,
+            timeout=5,
+        )
+        process.wait(timeout=5)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="the E2B terminator runs on Linux")
 def test_e2b_terminator_refreshes_groups_after_term_rehomes_a_process() -> None:
     token = "test-token"
@@ -2966,6 +2998,36 @@ async def test_e2b_pty_start_non_tty_wakes_when_exit_follows_last_output() -> No
 
 
 @pytest.mark.asyncio
+async def test_e2b_legacy_relocated_command_retains_termination_on_exit() -> None:
+    class _LegacyRelocatedSession(E2BSandboxSession):
+        async def _managed_process_command(
+            self,
+            sanitized_command,
+            *,
+            process_token,
+        ):
+            _ = process_token
+            return ["remote-exec", *sanitized_command]
+
+    sandbox = _FakeE2BSandbox()
+    handle = _FakeE2BAsyncCommandHandle(wait_delay_s=0.01)
+    sandbox.commands.next_async_command_handle = handle
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root="/workspace"),
+        snapshot=NoopSnapshot(id="snapshot"),
+        sandbox_id=sandbox.sandbox_id,
+        workspace_root_ready=True,
+    )
+    session = _LegacyRelocatedSession.from_state(state, sandbox=sandbox)
+
+    completed = await session.pty_exec_start("true", shell=False, tty=False, yield_time_s=10)
+
+    assert completed.exit_code == 0
+    assert sandbox.commands.group_termination_calls == [handle.pid]
+
+
+@pytest.mark.asyncio
 async def test_e2b_pty_start_tty_wakes_when_session_exits_after_output() -> None:
     sandbox = _FakeE2BSandbox()
     handle = _FakeE2BPtyHandle(wait_never=False, wait_delay_s=0.01)
@@ -2991,7 +3053,7 @@ async def test_e2b_pty_start_tty_wakes_when_session_exits_after_output() -> None
     assert handle.stdin_payloads == [b"exit\n"]
     assert handle.wait_calls == 1
     assert handle.kill_calls == 0
-    assert sandbox.commands.group_termination_calls == []
+    assert sandbox.commands.group_termination_calls == [handle.pid]
     assert session._pty_processes == {}  # noqa: SLF001
     assert session._reserved_pty_process_ids == set()  # noqa: SLF001
 
