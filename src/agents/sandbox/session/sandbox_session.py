@@ -101,7 +101,7 @@ def _exec_finish_data(start_data: dict[str, object] | None, result: object) -> d
 
 def _read_start_data(
     self: SandboxSession,
-    path: Path,
+    path: Path | str,
     *,
     user: str | User | None = None,
 ) -> dict[str, object]:
@@ -583,6 +583,15 @@ class SandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> list[FileEntry]:
         return await self._inner.ls(path, user=user)
+
+    @instrumented_op("stat", data=_read_start_data)
+    async def stat(
+        self,
+        path: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> FileEntry | None:
+        return await self._inner.stat(path, user=user)
 
     async def rm(
         self,

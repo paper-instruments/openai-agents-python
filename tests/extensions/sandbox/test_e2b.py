@@ -5,6 +5,7 @@ import base64
 import builtins
 import inspect
 import io
+import json
 import logging
 import os
 import shlex
@@ -47,6 +48,7 @@ from agents.sandbox.entries import (
 )
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
 from agents.sandbox.errors import (
+    ExecNonZeroError,
     ExecTimeoutError,
     ExecTransportError,
     InvalidManifestPathError,
@@ -54,6 +56,7 @@ from agents.sandbox.errors import (
     PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
+    WorkspaceReadNotFoundError,
     WorkspaceStartError,
 )
 from agents.sandbox.files import EntryKind
@@ -67,6 +70,7 @@ from agents.sandbox.session.runtime_helpers import (
 )
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExecResult, User
+from agents.sandbox.workspace_paths import SandboxPathGrant
 
 
 def test_e2b_package_re_exports_backend_symbols() -> None:
@@ -964,6 +968,325 @@ def _session(
         exposed_ports=exposed_ports,
     )
     return E2BSandboxSession.from_state(state, sandbox=sandbox), sandbox
+
+
+class _LocalStatE2BSession(E2BSandboxSession):
+    def __init__(self, *, state: E2BSandboxSessionState, sandbox: object) -> None:
+        super().__init__(state=state, sandbox=sandbox)
+        self.stat_exec_calls: list[tuple[str, ...]] = []
+
+    async def _exec_internal(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        rendered = tuple(str(part) for part in command)
+        self.stat_exec_calls.append(rendered)
+        process = await asyncio.create_subprocess_exec(
+            *rendered,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return ExecResult(stdout=stdout, stderr=stderr, exit_code=process.returncode or 0)
+
+
+def _local_stat_session(
+    workspace: Path,
+    *,
+    extra_path_grants: tuple[SandboxPathGrant, ...] = (),
+) -> _LocalStatE2BSession:
+    state = E2BSandboxSessionState(
+        session_id=uuid.uuid4(),
+        manifest=Manifest(root=str(workspace), extra_path_grants=extra_path_grants),
+        snapshot=NoopSnapshot(id="stat-snapshot"),
+        sandbox_id="sb-local-stat",
+        workspace_root_ready=True,
+    )
+    return _LocalStatE2BSession(state=state, sandbox=_FakeE2BSandbox())
+
+
+def _stat_entry_stdout(*, mode: int = 0o100640, size: int = 4) -> str:
+    return json.dumps(
+        {
+            "group": "runner",
+            "mode": mode,
+            "owner": "runner",
+            "size": size,
+            "status": "entry",
+        }
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_kind", "expected_size"),
+    [
+        (EntryKind.FILE, 5),
+        (EntryKind.DIRECTORY, None),
+        (EntryKind.OTHER, None),
+    ],
+)
+async def test_e2b_stat_returns_metadata_with_one_routed_exec(
+    tmp_path: Path,
+    entry_kind: EntryKind,
+    expected_size: int | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target"
+    if entry_kind is EntryKind.FILE:
+        target.write_bytes(b"hello")
+    elif entry_kind is EntryKind.DIRECTORY:
+        target.mkdir()
+    else:
+        os.mkfifo(target)
+    session = _local_stat_session(workspace)
+
+    result = await session.stat("target")
+
+    assert result is not None
+    assert result.path == target.as_posix()
+    assert result.kind is entry_kind
+    assert result.permissions.directory is (entry_kind is EntryKind.DIRECTORY)
+    if expected_size is not None:
+        assert result.size == expected_size
+    assert len(session.stat_exec_calls) == 1
+    assert session.stat_exec_calls[0][:2] == ("python3", "-c")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+async def test_e2b_stat_returns_none_only_for_missing_final_target(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _local_stat_session(workspace)
+
+    result = await session.stat("missing.txt")
+
+    assert result is None
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_kind", "reason"),
+    [
+        ("missing", "missing_ancestor"),
+        ("file", "not_directory"),
+    ],
+)
+async def test_e2b_stat_distinguishes_invalid_ancestors(
+    tmp_path: Path,
+    parent_kind: str,
+    reason: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if parent_kind == "file":
+        (workspace / "parent").write_text("not a directory", encoding="utf-8")
+    session = _local_stat_session(workspace)
+
+    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
+        await session.stat("parent/target.txt")
+
+    assert exc_info.value.context["reason"] == reason
+    assert exc_info.value.context["component"] == (workspace / "parent").as_posix()
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+async def test_e2b_stat_rejects_parent_symlink_without_following_it(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real_parent = workspace / "real"
+    real_parent.mkdir()
+    (real_parent / "target.txt").write_text("content", encoding="utf-8")
+    (workspace / "parent").symlink_to(real_parent, target_is_directory=True)
+    session = _local_stat_session(workspace)
+
+    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
+        await session.stat("parent/target.txt")
+
+    assert exc_info.value.context == {
+        "path": (workspace / "parent" / "target.txt").as_posix(),
+        "reason": "parent_symlink",
+        "component": (workspace / "parent").as_posix(),
+    }
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+async def test_e2b_stat_rejects_remote_leaf_symlink_escape_with_one_exec(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "target.txt").write_text("secret", encoding="utf-8")
+    link = workspace / "link.txt"
+    link.symlink_to(outside / "target.txt")
+    session = _local_stat_session(workspace)
+
+    with pytest.raises(InvalidManifestPathError) as exc_info:
+        await session.stat("link.txt")
+
+    assert exc_info.value.context["resolved_path"] == (outside / "target.txt").as_posix()
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+async def test_e2b_stat_returns_leaf_symlink_metadata(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "target.txt").write_text("content", encoding="utf-8")
+    link = workspace / "link.txt"
+    link.symlink_to("target.txt")
+    session = _local_stat_session(workspace)
+
+    result = await session.stat("link.txt")
+
+    assert result is not None
+    assert result.path == link.as_posix()
+    assert result.kind is EntryKind.SYMLINK
+    assert len(session.stat_exec_calls) == 1
+
+    dangling = workspace / "dangling.txt"
+    dangling.symlink_to("missing.txt")
+    dangling_result = await session.stat("dangling.txt")
+    assert dangling_result is not None
+    assert dangling_result.kind is EntryKind.SYMLINK
+    assert len(session.stat_exec_calls) == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
+@pytest.mark.asyncio
+async def test_e2b_stat_honors_grants_and_rejects_lexical_escapes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    grant = tmp_path / "grant"
+    grant.mkdir()
+    granted_file = grant / "allowed.txt"
+    granted_file.write_text("allowed", encoding="utf-8")
+    session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=grant.as_posix()),),
+    )
+
+    result = await session.stat(granted_file)
+
+    assert result is not None
+    assert result.path == granted_file.as_posix()
+    assert result.kind is EntryKind.FILE
+    assert len(session.stat_exec_calls) == 1
+    with pytest.raises(InvalidManifestPathError):
+        await session.stat("../outside.txt")
+    assert len(session.stat_exec_calls) == 1
+
+    root_grant = tmp_path / "root-grant"
+    root_grant.symlink_to("/", target_is_directory=True)
+    invalid_grant_session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=root_grant.as_posix()),),
+    )
+    with pytest.raises(ValueError, match="must not resolve to filesystem root"):
+        await invalid_grant_session.stat("allowed.txt")
+    assert len(invalid_grant_session.stat_exec_calls) == 1
+
+    real_grant = tmp_path / "real-grant"
+    real_grant.mkdir()
+    (real_grant / "child.txt").write_text("child", encoding="utf-8")
+    symlink_grant = tmp_path / "symlink-grant"
+    symlink_grant.symlink_to(real_grant, target_is_directory=True)
+    symlink_grant_session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=symlink_grant.as_posix()),),
+    )
+    symlink_grant_result = await symlink_grant_session.stat(symlink_grant / "child.txt")
+    assert symlink_grant_result is not None
+    assert symlink_grant_result.kind is EntryKind.FILE
+    assert len(symlink_grant_session.stat_exec_calls) == 1
+
+    exact_grant_session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=symlink_grant.as_posix()),),
+    )
+    exact_grant_result = await exact_grant_session.stat(symlink_grant)
+    assert exact_grant_result is not None
+    assert exact_grant_result.kind is EntryKind.SYMLINK
+    assert len(exact_grant_session.stat_exec_calls) == 1
+
+    dangling_grant = tmp_path / "dangling-grant"
+    dangling_grant.symlink_to(tmp_path / "missing-grant", target_is_directory=True)
+    dangling_grant_session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=dangling_grant.as_posix()),),
+    )
+    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
+        await dangling_grant_session.stat(dangling_grant / "child.txt")
+    assert exc_info.value.context["reason"] == "missing_ancestor"
+    assert len(dangling_grant_session.stat_exec_calls) == 1
+
+    blocking_parent = tmp_path / "blocking-parent"
+    blocking_parent.write_text("not a directory", encoding="utf-8")
+    blocked_grant = blocking_parent / "grant"
+    blocked_grant_session = _local_stat_session(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=blocked_grant.as_posix()),),
+    )
+    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
+        await blocked_grant_session.stat(blocked_grant / "child.txt")
+    assert exc_info.value.context["reason"] == "not_directory"
+    assert len(blocked_grant_session.stat_exec_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_e2b_stat_passes_optional_user_through_provider_exec() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    sandbox.commands.next_result = _FakeE2BResult(stdout=_stat_entry_stdout(mode=0o140770))
+
+    result = await session.stat("report.txt", user=User(name="runner"))
+
+    assert result is not None
+    assert result.path == "/workspace/report.txt"
+    assert result.kind is EntryKind.OTHER
+    assert result.permissions.directory is False
+    assert len(sandbox.commands.calls) == 1
+    call = sandbox.commands.calls[0]
+    assert shlex.split(str(call["command"]))[:2] == ["python3", "-c"]
+    assert call["user"] == "runner"
+
+
+@pytest.mark.asyncio
+async def test_e2b_stat_propagates_operational_failure() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    sandbox.commands.next_result = _FakeE2BResult(stderr="permission denied", exit_code=13)
+
+    with pytest.raises(ExecNonZeroError, match="permission denied"):
+        await session.stat("report.txt")
+
+    assert len(sandbox.commands.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_e2b_stat_rejects_malformed_provider_output() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    sandbox.commands.next_result = _FakeE2BResult(stdout="not-json")
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await session.stat("report.txt")
+
+    assert exc_info.value.context["reason"] == "malformed_stat_response"
+    assert len(sandbox.commands.calls) == 1
 
 
 def _tar_bytes() -> bytes:

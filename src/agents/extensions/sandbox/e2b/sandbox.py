@@ -40,6 +40,7 @@ from ....sandbox.errors import (
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
+    InvalidManifestPathError,
     PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
@@ -47,6 +48,7 @@ from ....sandbox.errors import (
     WorkspaceStartError,
     WorkspaceWriteTypeError,
 )
+from ....sandbox.files import EntryKind, FileEntry
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
@@ -67,7 +69,7 @@ from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, R
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.session.tar_workspace import shell_tar_exclude_args
 from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
-from ....sandbox.types import ExecResult, ExposedPortEndpoint, User
+from ....sandbox.types import ExecResult, ExposedPortEndpoint, Permissions, User
 from ....sandbox.util.retry import (
     TRANSIENT_HTTP_STATUS_CODES,
     exception_chain_contains_type,
@@ -76,7 +78,7 @@ from ....sandbox.util.retry import (
     retry_async,
 )
 from ....sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
-from ....sandbox.workspace_paths import posix_path_for_error, sandbox_path_str
+from ....sandbox.workspace_paths import coerce_posix_path, posix_path_for_error, sandbox_path_str
 
 WorkspacePersistenceMode = Literal["tar", "snapshot"]
 E2BTimeoutAction = Literal["kill", "pause"]
@@ -91,6 +93,134 @@ _E2B_MANAGED_PROCESS_TOKEN_ENV = "OPENAI_AGENTS_MANAGED_PROCESS_TOKEN"
 _E2B_PROCESS_GROUP_MAX_START_POLLS = 20
 _E2B_PROCESS_GROUP_TERM_POLLS = 10
 _E2B_PROCESS_GROUP_TERM_POLL_S = 0.05
+
+_E2B_STAT_SCRIPT = """
+import grp
+import json
+import os
+import pwd
+import stat
+import sys
+
+root, target, *grant_roots = sys.argv[1:]
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+lexical_roots = [root, *grant_roots]
+containing_roots = []
+for allowed_root in lexical_roots:
+    try:
+        if os.path.commonpath((allowed_root, target)) == allowed_root:
+            containing_roots.append(allowed_root)
+    except ValueError:
+        pass
+if not containing_roots:
+    emit({"resolved_path": target, "status": "escape"})
+    raise SystemExit(0)
+boundary = max(containing_roots, key=lambda path: len(path.split(os.sep)))
+
+resolved_root = os.path.realpath(root)
+resolved_grant_roots = []
+for grant_root in grant_roots:
+    resolved_grant = os.path.realpath(grant_root)
+    if resolved_grant == os.sep:
+        emit({"component": grant_root, "status": "invalid_grant_root"})
+        raise SystemExit(0)
+    resolved_grant_roots.append(resolved_grant)
+
+try:
+    boundary_metadata = os.lstat(boundary)
+except FileNotFoundError:
+    status = "missing" if boundary == target else "missing_ancestor"
+    emit({"component": boundary, "status": status})
+    raise SystemExit(0)
+except NotADirectoryError:
+    emit({"component": os.path.dirname(boundary), "status": "not_directory"})
+    raise SystemExit(0)
+
+if boundary == target:
+    metadata = boundary_metadata
+else:
+    if stat.S_ISLNK(boundary_metadata.st_mode):
+        try:
+            resolved_boundary_metadata = os.stat(boundary)
+        except FileNotFoundError:
+            emit({"component": boundary, "status": "missing_ancestor"})
+            raise SystemExit(0)
+        except NotADirectoryError:
+            emit({"component": boundary, "status": "not_directory"})
+            raise SystemExit(0)
+        if not stat.S_ISDIR(resolved_boundary_metadata.st_mode):
+            emit({"component": boundary, "status": "not_directory"})
+            raise SystemExit(0)
+    elif not stat.S_ISDIR(boundary_metadata.st_mode):
+        emit({"component": boundary, "status": "not_directory"})
+        raise SystemExit(0)
+
+    relative = os.path.relpath(target, boundary)
+    parts = relative.split(os.sep)
+    current = boundary
+    for part in parts[:-1]:
+        current = os.path.join(current, part)
+        try:
+            component_metadata = os.lstat(current)
+        except FileNotFoundError:
+            emit({"component": current, "status": "missing_ancestor"})
+            raise SystemExit(0)
+        except NotADirectoryError:
+            emit({"component": os.path.dirname(current), "status": "not_directory"})
+            raise SystemExit(0)
+        if stat.S_ISLNK(component_metadata.st_mode):
+            emit({"component": current, "status": "parent_symlink"})
+            raise SystemExit(0)
+        if not stat.S_ISDIR(component_metadata.st_mode):
+            emit({"component": current, "status": "not_directory"})
+            raise SystemExit(0)
+
+    try:
+        metadata = os.lstat(target)
+    except FileNotFoundError:
+        emit({"component": target, "status": "missing"})
+        raise SystemExit(0)
+    except NotADirectoryError:
+        emit({"component": os.path.dirname(target), "status": "not_directory"})
+        raise SystemExit(0)
+
+    resolved_target = os.path.realpath(target)
+    resolved_allowed_roots = [resolved_root, *resolved_grant_roots]
+    try:
+        target_is_allowed = any(
+            os.path.commonpath((allowed_root, resolved_target)) == allowed_root
+            for allowed_root in resolved_allowed_roots
+        )
+    except ValueError:
+        target_is_allowed = False
+    if not target_is_allowed:
+        emit({"resolved_path": resolved_target, "status": "escape"})
+        raise SystemExit(0)
+
+try:
+    owner = pwd.getpwuid(metadata.st_uid).pw_name
+except KeyError:
+    owner = str(metadata.st_uid)
+try:
+    group = grp.getgrgid(metadata.st_gid).gr_name
+except KeyError:
+    group = str(metadata.st_gid)
+
+emit(
+    {
+        "group": group,
+        "mode": metadata.st_mode,
+        "owner": owner,
+        "size": metadata.st_size,
+        "status": "entry",
+    }
+)
+""".strip()
 
 _E2B_PROCESS_SUPERVISOR = f"""
 import os
@@ -1517,6 +1647,150 @@ class E2BSandboxSession(BaseSandboxSession):
                     )
             if first_error is not None:
                 raise first_error
+
+    async def stat(
+        self,
+        path: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> FileEntry | None:
+        path_policy = self._workspace_path_policy()
+        original_path = coerce_posix_path(path)
+        workspace_path = path_policy.normalize_sandbox_path(path)
+        path_arg = workspace_path.as_posix()
+        grant_roots = tuple(
+            root.as_posix() for root, _read_only in path_policy.extra_path_grant_rules()
+        )
+        command = ("stat", path_arg)
+        result = await self.exec(
+            "python3",
+            "-c",
+            _E2B_STAT_SCRIPT,
+            path_policy.sandbox_root().as_posix(),
+            path_arg,
+            *grant_roots,
+            timeout=self.state.timeouts.fast_op_s,
+            shell=False,
+            user=user,
+        )
+        if not result.ok():
+            raise ExecNonZeroError(result, command=command)
+
+        try:
+            stdout = result.stdout.decode("utf-8")
+            payload = json.loads(stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ExecTransportError(
+                command=command,
+                context={
+                    "reason": "malformed_stat_response",
+                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    "stderr": result.stderr.decode("utf-8", errors="replace"),
+                },
+                cause=exc,
+                retryable=False,
+            ) from exc
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+
+        status = payload["status"]
+        if status == "missing":
+            if payload.get("component") == path_arg:
+                return None
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status == "escape":
+            resolved_path = payload.get("resolved_path")
+            if not isinstance(resolved_path, str) or not resolved_path:
+                raise ExecTransportError(
+                    command=command,
+                    context={"reason": "malformed_stat_response", "stdout": stdout},
+                    retryable=False,
+                )
+            reason: Literal["absolute", "escape_root"] = (
+                "absolute" if original_path.is_absolute() else "escape_root"
+            )
+            raise InvalidManifestPathError(
+                rel=original_path.as_posix(),
+                reason=reason,
+                context={"resolved_path": resolved_path},
+            )
+        if status == "invalid_grant_root":
+            component = payload.get("component")
+            if isinstance(component, str) and component:
+                raise ValueError(
+                    f"extra path grant must not resolve to filesystem root: {component}"
+                )
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status in {"missing_ancestor", "not_directory", "parent_symlink"}:
+            component = payload.get("component")
+            if isinstance(component, str) and component:
+                raise WorkspaceReadNotFoundError(
+                    path=posix_path_for_error(workspace_path),
+                    context={"reason": status, "component": component},
+                )
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status != "entry":
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+
+        mode = payload.get("mode")
+        owner = payload.get("owner")
+        group = payload.get("group")
+        size = payload.get("size")
+        if (
+            not isinstance(mode, int)
+            or isinstance(mode, bool)
+            or mode < 0
+            or not isinstance(owner, str)
+            or not isinstance(group, str)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+        ):
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        kind = {
+            0o040000: EntryKind.DIRECTORY,
+            0o100000: EntryKind.FILE,
+            0o120000: EntryKind.SYMLINK,
+        }.get(mode & 0o170000, EntryKind.OTHER)
+        permissions = Permissions(
+            owner=(mode >> 6) & 0b111,
+            group=(mode >> 3) & 0b111,
+            other=mode & 0b111,
+            directory=kind == EntryKind.DIRECTORY,
+        )
+        return FileEntry(
+            path=path_arg,
+            permissions=permissions,
+            owner=owner,
+            group=group,
+            size=size,
+            kind=kind,
+        )
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
