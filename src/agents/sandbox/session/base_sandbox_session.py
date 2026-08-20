@@ -26,7 +26,7 @@ from ..errors import (
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
 )
-from ..files import FileEntry
+from ..files import EntryKind, FileEntry
 from ..manifest import Manifest
 from ..materialization import MaterializationResult, MaterializedFile
 from ..types import ExecResult, ExposedPortEndpoint, User
@@ -940,6 +940,128 @@ class BaseSandboxSession(abc.ABC):
             raise ExecNonZeroError(result, command=cmd)
 
         return parse_ls_la(result.stdout.decode("utf-8", errors="replace"), base=path_arg)
+
+    async def stat(
+        self,
+        path: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> FileEntry | None:
+        """Return metadata for a filesystem entry, following safe symlinks.
+
+        ``None`` means the final target is missing. Missing or invalid ancestors raise a
+        structured workspace error, while operational listing failures propagate unchanged.
+
+        :param path: Path to inspect.
+        :param user: Optional sandbox user to inspect as.
+        :returns: The matching ``FileEntry``, or ``None`` when only the final target is missing.
+        """
+        path_policy = self._workspace_path_policy()
+        workspace_path = path_policy.normalize_sandbox_path(path)
+        allowed_roots = (
+            path_policy.sandbox_root(),
+            *(root for root, _read_only in path_policy.extra_path_grant_rules()),
+        )
+        boundary = max(
+            root
+            for root in allowed_roots
+            if workspace_path == root or root in workspace_path.parents
+        )
+        await self._validate_path_access(path)
+
+        async def probe(candidate: PurePath) -> FileEntry | None:
+            candidate_arg = candidate.as_posix()
+            command = ("env", "LC_ALL=C", "ls", "-Lld", "--", candidate_arg)
+            result = await self.exec(*command, shell=False, user=user)
+            if not result.ok():
+                if result.exit_code in {126, 127}:
+                    raise ExecNonZeroError(result, command=command)
+                stderr = result.stderr.decode("utf-8", errors="replace")
+                if "No such file or directory" in stderr:
+                    return None
+                if "Not a directory" in stderr:
+                    raise WorkspaceReadNotFoundError(
+                        path=posix_path_for_error(workspace_path),
+                        context={
+                            "reason": "not_directory",
+                            "component": candidate.parent.as_posix(),
+                        },
+                    )
+                raise ExecNonZeroError(result, command=command)
+            entries = parse_ls_la(
+                result.stdout.decode("utf-8", errors="replace"),
+                base=candidate.parent.as_posix(),
+            )
+            if len(entries) != 1:
+                raise ExecTransportError(
+                    command=command,
+                    context={
+                        "reason": "malformed_stat_response",
+                        "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    },
+                    retryable=False,
+                )
+            parsed = entries[0]
+            return FileEntry(
+                path=candidate_arg,
+                permissions=parsed.permissions,
+                owner=parsed.owner,
+                group=parsed.group,
+                size=parsed.size,
+                kind=parsed.kind,
+            )
+
+        boundary_entry = await probe(boundary)
+        if boundary_entry is None:
+            if workspace_path == boundary:
+                return None
+            raise WorkspaceReadNotFoundError(
+                path=posix_path_for_error(workspace_path),
+                context={
+                    "reason": "missing_ancestor",
+                    "component": boundary.as_posix(),
+                },
+            )
+        if workspace_path == boundary:
+            return boundary_entry
+        if boundary_entry.kind != EntryKind.DIRECTORY:
+            raise WorkspaceReadNotFoundError(
+                path=posix_path_for_error(workspace_path),
+                context={
+                    "reason": "not_directory",
+                    "component": boundary.as_posix(),
+                },
+            )
+
+        current = boundary
+        relative_parts = workspace_path.relative_to(boundary).parts
+        for index, part in enumerate(relative_parts):
+            candidate = current / part
+            entry = await probe(candidate)
+            is_final = index == len(relative_parts) - 1
+            if entry is None:
+                if is_final:
+                    return None
+                raise WorkspaceReadNotFoundError(
+                    path=posix_path_for_error(workspace_path),
+                    context={
+                        "reason": "missing_ancestor",
+                        "component": candidate.as_posix(),
+                    },
+                )
+            if is_final:
+                return entry
+            if entry.kind != EntryKind.DIRECTORY:
+                raise WorkspaceReadNotFoundError(
+                    path=posix_path_for_error(workspace_path),
+                    context={
+                        "reason": "not_directory",
+                        "component": candidate.as_posix(),
+                    },
+                )
+            current = candidate
+
+        raise AssertionError("stat component walk must return an entry or error")
 
     async def rm(
         self,

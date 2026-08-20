@@ -59,6 +59,7 @@ OpName = Literal[
     "start",
     "stop",
     "exec",
+    "stat",
     "read",
     "write",
     "shutdown",
