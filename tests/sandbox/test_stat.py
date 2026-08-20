@@ -43,7 +43,7 @@ class _StatSession(BaseSandboxSession):
     async def _validate_path_access(self, path: Path | str, *, for_write: bool = False) -> Path:
         _ = for_write
         self.validation_calls.append(path)
-        if path == "escape.txt" or path == Path("/invalid-grant"):
+        if Path(path) in {Path("escape.txt"), Path("/invalid-grant")}:
             raise InvalidManifestPathError(rel=path, reason="escape_root")
         return self.normalize_path(path)
 
@@ -68,10 +68,7 @@ class _StatSession(BaseSandboxSession):
             )
         if target == "/workspace/link -> name":
             return ExecResult(
-                stdout=(
-                    b"lrwxrwxrwx 1 runner runner 12 Jan 1 00:00 "
-                    b"/workspace/link -> name -> /workspace/notes.txt\n"
-                ),
+                stdout=b"-rw-r----- 1 runner runner 12 Jan 1 00:00 /workspace/link -> name\n",
                 stderr=b"",
                 exit_code=0,
             )
@@ -143,15 +140,15 @@ async def test_base_stat_uses_portable_listing_fallback() -> None:
         "env",
         "LC_ALL=C",
         "ls",
-        "-ld",
+        "-Lld",
     )
     assert "python3" not in session.exec_calls[0]
 
     assert await BaseSandboxSession.stat(session, "missing.txt", user="runner") is None
-    arrow_link = await BaseSandboxSession.stat(session, "link -> name", user="runner")
-    assert arrow_link is not None
-    assert arrow_link.path == "/workspace/link -> name"
-    assert arrow_link.kind is EntryKind.SYMLINK
+    arrow_name = await BaseSandboxSession.stat(session, "link -> name", user="runner")
+    assert arrow_name is not None
+    assert arrow_name.path == "/workspace/link -> name"
+    assert arrow_name.kind is EntryKind.FILE
     assert await BaseSandboxSession.stat(session, "/missing-grant", user="runner") is None
     with pytest.raises(InvalidManifestPathError):
         await BaseSandboxSession.stat(session, "escape.txt", user="runner")
@@ -162,18 +159,13 @@ async def test_base_stat_uses_portable_listing_fallback() -> None:
         await BaseSandboxSession.stat(session, "/invalid-grant", user="runner")
     assert len(session.exec_calls) == exec_call_count
     assert session.validation_calls == [
-        Path("/workspace"),
         "notes.txt",
-        Path("/workspace"),
         "missing.txt",
-        Path("/workspace"),
         "link -> name",
-        Path("/missing-grant"),
         "/missing-grant",
-        Path("/workspace"),
         "escape.txt",
-        Path("/denied-grant"),
-        Path("/invalid-grant"),
+        "/denied-grant",
+        "/invalid-grant",
     ]
 
 

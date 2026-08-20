@@ -947,7 +947,7 @@ class BaseSandboxSession(abc.ABC):
         *,
         user: str | User | None = None,
     ) -> FileEntry | None:
-        """Return metadata for a filesystem entry without following the leaf symlink.
+        """Return metadata for a filesystem entry, following safe symlinks.
 
         ``None`` means the final target is missing. Missing or invalid ancestors raise a
         structured workspace error, while operational listing failures propagate unchanged.
@@ -967,16 +967,11 @@ class BaseSandboxSession(abc.ABC):
             for root in allowed_roots
             if workspace_path == root or root in workspace_path.parents
         )
-        await self._validate_path_access(posix_path_as_path(boundary))
+        await self._validate_path_access(path)
 
-        async def probe(candidate: PurePath, *, follow_directory: bool = False) -> FileEntry | None:
+        async def probe(candidate: PurePath) -> FileEntry | None:
             candidate_arg = candidate.as_posix()
-            list_arg = (
-                candidate_arg
-                if not follow_directory or candidate_arg == "/"
-                else f"{candidate_arg}/"
-            )
-            command = ("env", "LC_ALL=C", "ls", "-ld", "--", list_arg)
+            command = ("env", "LC_ALL=C", "ls", "-Lld", "--", candidate_arg)
             result = await self.exec(*command, shell=False, user=user)
             if not result.ok():
                 if result.exit_code in {126, 127}:
@@ -989,11 +984,7 @@ class BaseSandboxSession(abc.ABC):
                         path=posix_path_for_error(workspace_path),
                         context={
                             "reason": "not_directory",
-                            "component": (
-                                candidate.as_posix()
-                                if follow_directory
-                                else candidate.parent.as_posix()
-                            ),
+                            "component": candidate.parent.as_posix(),
                         },
                     )
                 raise ExecNonZeroError(result, command=command)
@@ -1023,7 +1014,6 @@ class BaseSandboxSession(abc.ABC):
         boundary_entry = await probe(boundary)
         if boundary_entry is None:
             if workspace_path == boundary:
-                await self._validate_path_access(path)
                 return None
             raise WorkspaceReadNotFoundError(
                 path=posix_path_for_error(workspace_path),
@@ -1033,27 +1023,8 @@ class BaseSandboxSession(abc.ABC):
                 },
             )
         if workspace_path == boundary:
-            await self._validate_path_access(path)
             return boundary_entry
-        if boundary_entry.kind == EntryKind.SYMLINK:
-            followed_boundary = await probe(boundary, follow_directory=True)
-            if followed_boundary is None:
-                raise WorkspaceReadNotFoundError(
-                    path=posix_path_for_error(workspace_path),
-                    context={
-                        "reason": "missing_ancestor",
-                        "component": boundary.as_posix(),
-                    },
-                )
-            if followed_boundary.kind != EntryKind.DIRECTORY:
-                raise WorkspaceReadNotFoundError(
-                    path=posix_path_for_error(workspace_path),
-                    context={
-                        "reason": "not_directory",
-                        "component": boundary.as_posix(),
-                    },
-                )
-        elif boundary_entry.kind != EntryKind.DIRECTORY:
+        if boundary_entry.kind != EntryKind.DIRECTORY:
             raise WorkspaceReadNotFoundError(
                 path=posix_path_for_error(workspace_path),
                 context={
@@ -1070,7 +1041,6 @@ class BaseSandboxSession(abc.ABC):
             is_final = index == len(relative_parts) - 1
             if entry is None:
                 if is_final:
-                    await self._validate_path_access(path)
                     return None
                 raise WorkspaceReadNotFoundError(
                     path=posix_path_for_error(workspace_path),
@@ -1080,16 +1050,7 @@ class BaseSandboxSession(abc.ABC):
                     },
                 )
             if is_final:
-                await self._validate_path_access(path)
                 return entry
-            if entry.kind == EntryKind.SYMLINK:
-                raise WorkspaceReadNotFoundError(
-                    path=posix_path_for_error(workspace_path),
-                    context={
-                        "reason": "parent_symlink",
-                        "component": candidate.as_posix(),
-                    },
-                )
             if entry.kind != EntryKind.DIRECTORY:
                 raise WorkspaceReadNotFoundError(
                     path=posix_path_for_error(workspace_path),

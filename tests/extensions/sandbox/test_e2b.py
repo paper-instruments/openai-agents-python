@@ -1075,6 +1075,7 @@ async def test_e2b_stat_returns_none_only_for_missing_final_target(tmp_path: Pat
     ("parent_kind", "reason"),
     [
         ("missing", "missing_ancestor"),
+        ("dangling_symlink", "missing_ancestor"),
         ("file", "not_directory"),
     ],
 )
@@ -1087,6 +1088,8 @@ async def test_e2b_stat_distinguishes_invalid_ancestors(
     workspace.mkdir()
     if parent_kind == "file":
         (workspace / "parent").write_text("not a directory", encoding="utf-8")
+    elif parent_kind == "dangling_symlink":
+        (workspace / "parent").symlink_to("missing", target_is_directory=True)
     session = _local_stat_session(workspace)
 
     with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
@@ -1099,7 +1102,7 @@ async def test_e2b_stat_distinguishes_invalid_ancestors(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
 @pytest.mark.asyncio
-async def test_e2b_stat_rejects_parent_symlink_without_following_it(tmp_path: Path) -> None:
+async def test_e2b_stat_follows_safe_parent_symlink(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     real_parent = workspace / "real"
@@ -1108,33 +1111,39 @@ async def test_e2b_stat_rejects_parent_symlink_without_following_it(tmp_path: Pa
     (workspace / "parent").symlink_to(real_parent, target_is_directory=True)
     session = _local_stat_session(workspace)
 
-    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
-        await session.stat("parent/target.txt")
+    result = await session.stat("parent/target.txt")
 
-    assert exc_info.value.context == {
-        "path": (workspace / "parent" / "target.txt").as_posix(),
-        "reason": "parent_symlink",
-        "component": (workspace / "parent").as_posix(),
-    }
+    assert result is not None
+    assert result.path == (workspace / "parent" / "target.txt").as_posix()
+    assert result.kind is EntryKind.FILE
+    assert result.size == len("content")
     assert len(session.stat_exec_calls) == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
 @pytest.mark.asyncio
-async def test_e2b_stat_rejects_remote_leaf_symlink_escape_with_one_exec(
+@pytest.mark.parametrize("link_as_parent", [False, True])
+async def test_e2b_stat_rejects_remote_symlink_escape_with_one_exec(
     tmp_path: Path,
+    link_as_parent: bool,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "target.txt").write_text("secret", encoding="utf-8")
-    link = workspace / "link.txt"
-    link.symlink_to(outside / "target.txt")
+    if link_as_parent:
+        link = workspace / "link"
+        link.symlink_to(outside, target_is_directory=True)
+        requested_path = "link/target.txt"
+    else:
+        link = workspace / "link.txt"
+        link.symlink_to(outside / "target.txt")
+        requested_path = "link.txt"
     session = _local_stat_session(workspace)
 
     with pytest.raises(InvalidManifestPathError) as exc_info:
-        await session.stat("link.txt")
+        await session.stat(requested_path)
 
     assert exc_info.value.context["resolved_path"] == (outside / "target.txt").as_posix()
     assert len(session.stat_exec_calls) == 1
@@ -1142,7 +1151,9 @@ async def test_e2b_stat_rejects_remote_leaf_symlink_escape_with_one_exec(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the E2B worker runs on Linux")
 @pytest.mark.asyncio
-async def test_e2b_stat_returns_leaf_symlink_metadata(tmp_path: Path) -> None:
+async def test_e2b_stat_follows_safe_leaf_symlink_and_reports_dangling_target_missing(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "target.txt").write_text("content", encoding="utf-8")
@@ -1154,14 +1165,14 @@ async def test_e2b_stat_returns_leaf_symlink_metadata(tmp_path: Path) -> None:
 
     assert result is not None
     assert result.path == link.as_posix()
-    assert result.kind is EntryKind.SYMLINK
+    assert result.kind is EntryKind.FILE
+    assert result.size == len("content")
     assert len(session.stat_exec_calls) == 1
 
     dangling = workspace / "dangling.txt"
     dangling.symlink_to("missing.txt")
     dangling_result = await session.stat("dangling.txt")
-    assert dangling_result is not None
-    assert dangling_result.kind is EntryKind.SYMLINK
+    assert dangling_result is None
     assert len(session.stat_exec_calls) == 2
 
 
@@ -1219,7 +1230,7 @@ async def test_e2b_stat_honors_grants_and_rejects_lexical_escapes(tmp_path: Path
     )
     exact_grant_result = await exact_grant_session.stat(symlink_grant)
     assert exact_grant_result is not None
-    assert exact_grant_result.kind is EntryKind.SYMLINK
+    assert exact_grant_result.kind is EntryKind.DIRECTORY
     assert len(exact_grant_session.stat_exec_calls) == 1
 
     dangling_grant = tmp_path / "dangling-grant"

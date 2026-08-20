@@ -131,8 +131,21 @@ for grant_root in grant_roots:
         raise SystemExit(0)
     resolved_grant_roots.append(resolved_grant)
 
+resolved_target = os.path.realpath(target)
+resolved_allowed_roots = [resolved_root, *resolved_grant_roots]
 try:
-    boundary_metadata = os.lstat(boundary)
+    target_is_allowed = any(
+        os.path.commonpath((allowed_root, resolved_target)) == allowed_root
+        for allowed_root in resolved_allowed_roots
+    )
+except ValueError:
+    target_is_allowed = False
+if not target_is_allowed:
+    emit({"resolved_path": resolved_target, "status": "escape"})
+    raise SystemExit(0)
+
+try:
+    boundary_metadata = os.stat(boundary)
 except FileNotFoundError:
     status = "missing" if boundary == target else "missing_ancestor"
     emit({"component": boundary, "status": status})
@@ -144,19 +157,7 @@ except NotADirectoryError:
 if boundary == target:
     metadata = boundary_metadata
 else:
-    if stat.S_ISLNK(boundary_metadata.st_mode):
-        try:
-            resolved_boundary_metadata = os.stat(boundary)
-        except FileNotFoundError:
-            emit({"component": boundary, "status": "missing_ancestor"})
-            raise SystemExit(0)
-        except NotADirectoryError:
-            emit({"component": boundary, "status": "not_directory"})
-            raise SystemExit(0)
-        if not stat.S_ISDIR(resolved_boundary_metadata.st_mode):
-            emit({"component": boundary, "status": "not_directory"})
-            raise SystemExit(0)
-    elif not stat.S_ISDIR(boundary_metadata.st_mode):
+    if not stat.S_ISDIR(boundary_metadata.st_mode):
         emit({"component": boundary, "status": "not_directory"})
         raise SystemExit(0)
 
@@ -166,40 +167,24 @@ else:
     for part in parts[:-1]:
         current = os.path.join(current, part)
         try:
-            component_metadata = os.lstat(current)
+            component_metadata = os.stat(current)
         except FileNotFoundError:
             emit({"component": current, "status": "missing_ancestor"})
             raise SystemExit(0)
         except NotADirectoryError:
             emit({"component": os.path.dirname(current), "status": "not_directory"})
             raise SystemExit(0)
-        if stat.S_ISLNK(component_metadata.st_mode):
-            emit({"component": current, "status": "parent_symlink"})
-            raise SystemExit(0)
         if not stat.S_ISDIR(component_metadata.st_mode):
             emit({"component": current, "status": "not_directory"})
             raise SystemExit(0)
 
     try:
-        metadata = os.lstat(target)
+        metadata = os.stat(target)
     except FileNotFoundError:
         emit({"component": target, "status": "missing"})
         raise SystemExit(0)
     except NotADirectoryError:
         emit({"component": os.path.dirname(target), "status": "not_directory"})
-        raise SystemExit(0)
-
-    resolved_target = os.path.realpath(target)
-    resolved_allowed_roots = [resolved_root, *resolved_grant_roots]
-    try:
-        target_is_allowed = any(
-            os.path.commonpath((allowed_root, resolved_target)) == allowed_root
-            for allowed_root in resolved_allowed_roots
-        )
-    except ValueError:
-        target_is_allowed = False
-    if not target_is_allowed:
-        emit({"resolved_path": resolved_target, "status": "escape"})
         raise SystemExit(0)
 
 try:
@@ -1734,7 +1719,7 @@ class E2BSandboxSession(BaseSandboxSession):
                 context={"reason": "malformed_stat_response", "stdout": stdout},
                 retryable=False,
             )
-        if status in {"missing_ancestor", "not_directory", "parent_symlink"}:
+        if status in {"missing_ancestor", "not_directory"}:
             component = payload.get("component")
             if isinstance(component, str) and component:
                 raise WorkspaceReadNotFoundError(
