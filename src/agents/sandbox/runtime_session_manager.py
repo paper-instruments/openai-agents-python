@@ -204,16 +204,40 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         agent_id = id(agent)
         resources = self._resources_by_agent.get(agent_id)
         if resources is None:
-            resources = await self._create_resources(
-                agent=agent,
-                capabilities=capabilities,
-                is_resumed_state=is_resumed_state,
-            )
+            semaphore = self._require_sandbox_config().preparation_semaphore
+            if semaphore is None:
+                resources = await self._create_started_resources(
+                    agent=agent,
+                    capabilities=capabilities,
+                    is_resumed_state=is_resumed_state,
+                )
+            else:
+                async with semaphore:
+                    resources = await self._create_started_resources(
+                        agent=agent,
+                        capabilities=capabilities,
+                        is_resumed_state=is_resumed_state,
+                    )
             self._resources_by_agent[agent_id] = resources
+        else:
+            await resources.ensure_started()
         self._current_agent_id = agent_id
-
-        await resources.ensure_started()
         return resources.session
+
+    async def _create_started_resources(
+        self,
+        *,
+        agent: SandboxAgent[TContext],
+        capabilities: list[Capability],
+        is_resumed_state: bool,
+    ) -> _SandboxSessionResources:
+        resources = await self._create_resources(
+            agent=agent,
+            capabilities=capabilities,
+            is_resumed_state=is_resumed_state,
+        )
+        await resources.ensure_started()
+        return resources
 
     def serialize_resume_state(self) -> dict[str, object] | None:
         existing_payload = (

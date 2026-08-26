@@ -219,6 +219,23 @@ class _LiveSessionDeltaRecorder(_FakeSession):
         return []
 
 
+class _BlockingLiveSessionDeltaRecorder(_LiveSessionDeltaRecorder):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.entry_batch_started = asyncio.Event()
+        self.release_entry_batch = asyncio.Event()
+
+    async def _apply_entry_batch(
+        self,
+        entries: Sequence[tuple[Path, BaseEntry]],
+        *,
+        base_dir: Path,
+    ) -> list[MaterializedFile]:
+        self.entry_batch_started.set()
+        await self.release_entry_batch.wait()
+        return await super()._apply_entry_batch(entries, base_dir=base_dir)
+
+
 class _PathGuardingSession(_FakeSession):
     def __init__(self, manifest: Manifest) -> None:
         super().__init__(manifest)
@@ -4362,6 +4379,59 @@ async def test_clear_workspace_root_on_resume_preserves_workspace_root_mount(
 
     assert ls_calls == []
     assert rm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_agent_honors_shared_sandbox_preparation_limit() -> None:
+    semaphore = asyncio.Semaphore(1)
+    sessions = [_BlockingLiveSessionDeltaRecorder(Manifest()) for _ in range(2)]
+    for session in sessions:
+        session._running = True
+
+    agents = [
+        SandboxAgent(
+            name=f"sandbox-{index}",
+            model=FakeModel(initial_output=[get_final_output_message("done")]),
+            instructions="Base instructions.",
+            capabilities=[_ManifestMutationCapability()],
+        )
+        for index in range(2)
+    ]
+    runtimes = [
+        SandboxRuntime(
+            starting_agent=agent,
+            run_config=RunConfig(
+                sandbox=SandboxRunConfig(
+                    session=session,
+                    preparation_semaphore=semaphore,
+                )
+            ),
+            run_state=None,
+        )
+        for agent, session in zip(agents, sessions, strict=True)
+    ]
+
+    async def prepare(index: int) -> None:
+        await runtimes[index].prepare_agent(
+            current_agent=agents[index],
+            current_input="hello",
+            context_wrapper=RunContextWrapper(context=None),
+            is_resumed_state=False,
+        )
+
+    first = asyncio.create_task(prepare(0))
+    await sessions[0].entry_batch_started.wait()
+    second = asyncio.create_task(prepare(1))
+    await asyncio.sleep(0)
+
+    assert not sessions[1].entry_batch_started.is_set()
+
+    sessions[0].release_entry_batch.set()
+    await sessions[1].entry_batch_started.wait()
+    sessions[1].release_entry_batch.set()
+    await asyncio.gather(first, second)
+
+    await asyncio.gather(*(runtime.cleanup() for runtime in runtimes))
 
 
 @pytest.mark.asyncio

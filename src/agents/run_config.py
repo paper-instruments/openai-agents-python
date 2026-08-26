@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -205,6 +206,13 @@ class SandboxRunConfig:
 
     Set to `None` to preserve the default behavior with no SDK archive resource limits.
     Use `SandboxArchiveLimits()` to enable SDK defaults.
+    """
+
+    preparation_semaphore: asyncio.Semaphore | None = None
+    """Shared process-local limit for first-time sandbox preparation.
+
+    The semaphore covers session creation or startup and initial manifest materialization. It is
+    released before the agent run begins. Set to `None` to preserve unrestricted preparation.
     """
 
 
