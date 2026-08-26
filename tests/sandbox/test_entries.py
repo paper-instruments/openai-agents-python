@@ -43,6 +43,7 @@ class _RecordingSession(BaseSandboxSession):
         )
         self.exec_calls: list[tuple[str, ...]] = []
         self.writes: dict[Path, bytes] = {}
+        self.write_batches: list[list[tuple[Path, bytes]]] = []
 
     async def _exec_internal(
         self,
@@ -61,6 +62,13 @@ class _RecordingSession(BaseSandboxSession):
     async def write(self, path: Path, data: io.IOBase, *, user: object = None) -> None:
         _ = user
         self.writes[path] = data.read()
+
+    async def _write_file_batch_immediately(
+        self,
+        files: Sequence[tuple[Path, bytes]],
+    ) -> None:
+        self.write_batches.append(list(files))
+        await super()._write_file_batch_immediately(files)
 
     async def running(self) -> bool:
         return True
@@ -1048,5 +1056,44 @@ async def test_apply_manifest_raises_on_chgrp_failure() -> None:
     with pytest.raises(ExecNonZeroError):
         await session.apply_manifest()
 
-    assert ("chgrp", "sandbox-user", "/workspace/copied.txt") in session.exec_calls
+    assert (
+        "chgrp",
+        "sandbox-user",
+        "/workspace/copied.txt",
+    ) in session.exec_calls
     assert not any(call[0] == "chmod" for call in session.exec_calls)
+
+
+@pytest.mark.asyncio
+async def test_apply_manifest_batches_file_chmod_after_nested_materialization() -> None:
+    session = _RecordingSession(
+        Manifest(
+            entries={
+                ".agents/alpha": Dir(
+                    children={
+                        "SKILL.md": File(content=b"alpha"),
+                        "references": Dir(
+                            children={
+                                "one.md": File(content=b"one"),
+                                "two.md": File(content=b"two"),
+                            }
+                        ),
+                    }
+                ),
+                ".agents/beta": Dir(children={"SKILL.md": File(content=b"beta")}),
+            }
+        )
+    )
+
+    await session.apply_manifest()
+
+    assert len(session.write_batches) == 1
+    assert set(session.write_batches[0]) == {
+        (Path("/workspace/.agents/alpha/SKILL.md"), b"alpha"),
+        (Path("/workspace/.agents/alpha/references/one.md"), b"one"),
+        (Path("/workspace/.agents/alpha/references/two.md"), b"two"),
+        (Path("/workspace/.agents/beta/SKILL.md"), b"beta"),
+    }
+    assert [call for call in session.exec_calls if call[0] == "chmod"] == [
+        ("chmod", "-R", "0755", "/workspace/.agents")
+    ]

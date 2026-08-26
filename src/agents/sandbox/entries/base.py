@@ -17,7 +17,6 @@ from ..types import FileMode, Group, Permissions, User
 from ..workspace_paths import (
     coerce_posix_path,
     posix_path_as_path,
-    sandbox_path_str,
     windows_absolute_path,
 )
 
@@ -162,12 +161,17 @@ class BaseEntry(BaseModel, abc.ABC):
         session: BaseSandboxSession,
         dest: Path,
     ) -> None:
-        dest_arg = sandbox_path_str(dest)
-        if self.group is not None:
-            await session._exec_checked_nonzero("chgrp", self.group.name, dest_arg)
+        group_name, chmod_perms = self._metadata_values()
+        await session._apply_entry_metadata(
+            dest,
+            group_name=group_name,
+            chmod_perms=chmod_perms,
+        )
 
+    def _metadata_values(self) -> tuple[str | None, str]:
+        group_name = self.group.name if self.group is not None else None
         chmod_perms = f"{stat.S_IMODE(self.permissions.to_mode()):o}".zfill(4)
-        await session._exec_checked_nonzero("chmod", chmod_perms, dest_arg)
+        return group_name, chmod_perms
 
     @abc.abstractmethod
     async def apply(

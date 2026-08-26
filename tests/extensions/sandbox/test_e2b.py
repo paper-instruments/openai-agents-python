@@ -1349,6 +1349,80 @@ async def test_e2b_manifest_uses_native_bulk_write_for_files() -> None:
 
 
 @pytest.mark.asyncio
+async def test_e2b_manifest_bulk_write_skips_remote_path_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+
+    async def fail_validation(*_args: object, **_kwargs: object) -> Path:
+        raise AssertionError("manifest bulk writes must not perform remote path validation")
+
+    monkeypatch.setattr(session, "_validate_path_access", fail_validation)
+
+    await session._write_file_batch_immediately(
+        [
+            (Path("/workspace/.agents/alpha/SKILL.md"), b"alpha"),
+            (Path("/workspace/.agents/beta/SKILL.md"), b"beta"),
+        ]
+    )
+
+    assert sandbox.files.write_files_calls == [
+        (
+            [
+                {"path": "/workspace/.agents/alpha/SKILL.md", "data": b"alpha"},
+                {"path": "/workspace/.agents/beta/SKILL.md", "data": b"beta"},
+            ],
+            session.state.timeouts.file_upload_s,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_e2b_manifest_uses_one_bulk_write_across_nested_directories() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    session.state.manifest = Manifest(
+        root="/workspace",
+        entries={
+            ".agents/alpha": Dir(
+                children={
+                    "SKILL.md": File(content=b"alpha"),
+                    "references": Dir(
+                        children={
+                            "one.md": File(content=b"one"),
+                            "two.md": File(content=b"two"),
+                        }
+                    ),
+                }
+            ),
+            ".agents/beta": Dir(
+                children={"SKILL.md": File(content=b"beta")},
+            ),
+        },
+    )
+
+    result = await session.apply_manifest()
+
+    assert result.files == []
+    assert sandbox.files.write_calls == []
+    assert len(sandbox.files.write_files_calls) == 1
+    uploaded_files, request_timeout = sandbox.files.write_files_calls[0]
+    assert request_timeout == session.state.timeouts.file_upload_s
+    assert {str(file["path"]): file["data"] for file in uploaded_files} == {
+        "/workspace/.agents/alpha/SKILL.md": b"alpha",
+        "/workspace/.agents/alpha/references/one.md": b"one",
+        "/workspace/.agents/alpha/references/two.md": b"two",
+        "/workspace/.agents/beta/SKILL.md": b"beta",
+    }
+    chmod_commands = [
+        call["command"]
+        for call in sandbox.commands.calls
+        if str(call["command"]).startswith("chmod ")
+    ]
+    assert chmod_commands == ["chmod -R 0755 /workspace/.agents"]
+
+
+@pytest.mark.asyncio
 async def test_e2b_sandbox_connect_prefers_full_sandbox_wrapper() -> None:
     class _FakeSandboxClass:
         calls: list[tuple[str, str, int | None]] = []

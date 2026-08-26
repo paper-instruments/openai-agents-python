@@ -1,7 +1,8 @@
 import abc
 import io
 import shlex
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path, PurePath
 from typing import Literal, TypeVar
 
@@ -121,6 +122,10 @@ class BaseSandboxSession(abc.ABC):
     _max_manifest_entry_concurrency: int | None = DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY
     _max_local_dir_file_concurrency: int | None = DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY
     _archive_limits: SandboxArchiveLimits | None = None
+    _file_write_batch_depth: int = 0
+    _pending_file_writes: list[tuple[Path, bytes]] | None = None
+    _entry_metadata_batch_depth: int = 0
+    _pending_entry_metadata: list[tuple[Path, str | None, str]] | None = None
 
     async def start(self) -> None:
         try:
@@ -1203,11 +1208,13 @@ class BaseSandboxSession(abc.ABC):
         only_ephemeral: bool = False,
         provision_accounts: bool = True,
     ) -> MaterializationResult:
-        return await manifest_ops.apply_manifest(
-            self,
-            only_ephemeral=only_ephemeral,
-            provision_accounts=provision_accounts,
-        )
+        async with self._batch_entry_metadata():
+            async with self._batch_file_writes():
+                return await manifest_ops.apply_manifest(
+                    self,
+                    only_ephemeral=only_ephemeral,
+                    provision_accounts=provision_accounts,
+                )
 
     async def apply_manifest(self, *, only_ephemeral: bool = False) -> MaterializationResult:
         return await self._apply_manifest(
@@ -1294,9 +1301,22 @@ class BaseSandboxSession(abc.ABC):
         *,
         base_dir: Path,
     ) -> list[MaterializedFile]:
-        return await manifest_ops.apply_entry_batch(self, entries, base_dir=base_dir)
+        async with self._batch_entry_metadata():
+            async with self._batch_file_writes():
+                return await manifest_ops.apply_entry_batch(self, entries, base_dir=base_dir)
 
     async def _write_file_batch(self, files: Sequence[tuple[Path, bytes]]) -> None:
+        pending = self._pending_file_writes
+        if self._file_write_batch_depth > 0 and pending is not None:
+            pending.extend(files)
+            return
+
+        await self._write_file_batch_immediately(files)
+
+    async def _write_file_batch_immediately(
+        self,
+        files: Sequence[tuple[Path, bytes]],
+    ) -> None:
         def _make_write_task(path: Path, content: bytes) -> Callable[[], Awaitable[None]]:
             async def _write() -> None:
                 await self.write(path, io.BytesIO(content))
@@ -1307,6 +1327,110 @@ class BaseSandboxSession(abc.ABC):
             [_make_write_task(path, content) for path, content in files],
             max_concurrency=self._max_manifest_entry_concurrency,
         )
+
+    @asynccontextmanager
+    async def _batch_file_writes(self) -> AsyncIterator[None]:
+        outermost = self._file_write_batch_depth == 0
+        if outermost:
+            self._pending_file_writes = []
+        self._file_write_batch_depth += 1
+        try:
+            yield
+        except BaseException:
+            if outermost:
+                self._pending_file_writes = None
+            raise
+        else:
+            if outermost:
+                pending = self._pending_file_writes or []
+                self._pending_file_writes = None
+                if pending:
+                    await self._write_file_batch_immediately(pending)
+        finally:
+            self._file_write_batch_depth -= 1
+
+    @asynccontextmanager
+    async def _batch_entry_metadata(self) -> AsyncIterator[None]:
+        outermost = self._entry_metadata_batch_depth == 0
+        if outermost:
+            self._pending_entry_metadata = []
+        self._entry_metadata_batch_depth += 1
+        try:
+            yield
+        except BaseException:
+            if outermost:
+                self._pending_entry_metadata = None
+            raise
+        else:
+            if outermost:
+                pending = self._pending_entry_metadata or []
+                self._pending_entry_metadata = None
+                await self._flush_entry_metadata(pending)
+        finally:
+            self._entry_metadata_batch_depth -= 1
+
+    async def _apply_entry_metadata(
+        self,
+        path: Path,
+        *,
+        group_name: str | None,
+        chmod_perms: str,
+    ) -> None:
+        pending = self._pending_entry_metadata
+        if self._entry_metadata_batch_depth > 0 and pending is not None:
+            pending.append((path, group_name, chmod_perms))
+            return
+
+        path_arg = sandbox_path_str(path)
+        if group_name is not None:
+            await self._exec_checked_nonzero("chgrp", group_name, path_arg)
+        await self._exec_checked_nonzero("chmod", chmod_perms, path_arg)
+
+    async def _flush_entry_metadata(
+        self,
+        metadata: Sequence[tuple[Path, str | None, str]],
+    ) -> None:
+        agents_metadata: dict[Path, list[tuple[Path, str | None, str]]] = {}
+        remaining_metadata: list[tuple[Path, str | None, str]] = []
+        for item in metadata:
+            agents_root = next(
+                (
+                    candidate
+                    for candidate in (item[0], *item[0].parents)
+                    if candidate.name == ".agents"
+                ),
+                None,
+            )
+            if agents_root is None:
+                remaining_metadata.append(item)
+            else:
+                agents_metadata.setdefault(agents_root, []).append(item)
+
+        for agents_root, subtree_metadata in agents_metadata.items():
+            group_names = {group_name for _, group_name, _ in subtree_metadata}
+            chmod_modes = {chmod_perms for _, _, chmod_perms in subtree_metadata}
+            if len(group_names) != 1 or len(chmod_modes) != 1:
+                remaining_metadata.extend(subtree_metadata)
+                continue
+
+            root_arg = sandbox_path_str(agents_root)
+            group_name = next(iter(group_names))
+            if group_name is not None:
+                await self._exec_checked_nonzero("chgrp", "-R", group_name, root_arg)
+            await self._exec_checked_nonzero("chmod", "-R", next(iter(chmod_modes)), root_arg)
+
+        paths_by_group: dict[str, list[str]] = {}
+        paths_by_mode: dict[str, list[str]] = {}
+        for path, group_name, chmod_perms in remaining_metadata:
+            path_arg = sandbox_path_str(path)
+            if group_name is not None:
+                paths_by_group.setdefault(group_name, []).append(path_arg)
+            paths_by_mode.setdefault(chmod_perms, []).append(path_arg)
+
+        for group_name, paths in paths_by_group.items():
+            await self._exec_checked_nonzero("chgrp", group_name, *paths)
+        for chmod_perms, paths in paths_by_mode.items():
+            await self._exec_checked_nonzero("chmod", chmod_perms, *paths)
 
     def _manifest_base_dir(self) -> Path:
         return Path.cwd()

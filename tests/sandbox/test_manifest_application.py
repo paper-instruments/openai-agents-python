@@ -222,54 +222,6 @@ async def test_manifest_applier_caps_parallel_entry_batch(
 
 
 @pytest.mark.asyncio
-async def test_manifest_applier_groups_independent_files_for_bulk_application() -> None:
-    apply_calls: list[Path] = []
-    file_batch_calls: list[list[tuple[Path, bytes]]] = []
-
-    async def mkdir(_path: Path) -> None:
-        return None
-
-    async def exec_checked_nonzero(*_command: str) -> ExecResult:
-        return ExecResult(stdout=b"", stderr=b"", exit_code=0)
-
-    async def apply_entry(_entry: object, dest: Path, _base_dir: Path) -> list[MaterializedFile]:
-        apply_calls.append(dest)
-        return _materialized(dest)
-
-    async def apply_file_batch(
-        entries: Sequence[tuple[Path, File]], _base_dir: Path
-    ) -> list[MaterializedFile]:
-        file_batch_calls.append([(dest, artifact.content) for dest, artifact in entries])
-        return []
-
-    applier = ManifestApplier(
-        mkdir=mkdir,
-        exec_checked_nonzero=exec_checked_nonzero,
-        apply_entry=apply_entry,
-        apply_file_batch=apply_file_batch,
-    )
-
-    result = await applier.apply_manifest(
-        Manifest(
-            entries={
-                "a.txt": File(content=b"a"),
-                "b.txt": File(content=b"b"),
-                "empty": Dir(),
-            }
-        )
-    )
-
-    assert file_batch_calls == [
-        [
-            (Path("/workspace/a.txt"), b"a"),
-            (Path("/workspace/b.txt"), b"b"),
-        ]
-    ]
-    assert apply_calls == [Path("/workspace/empty")]
-    assert result.files == _materialized(Path("/workspace/empty"))
-
-
-@pytest.mark.asyncio
 async def test_manifest_applier_provisions_groups_and_unique_users_before_entries() -> None:
     exec_calls: list[tuple[str, ...]] = []
 

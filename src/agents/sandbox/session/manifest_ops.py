@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..entries import BaseEntry, File
+from ..entries import BaseEntry
 from ..materialization import MaterializationResult, MaterializedFile
 from .manifest_application import ManifestApplier
 
@@ -55,7 +55,6 @@ def _build_manifest_applier(
         mkdir=lambda path: session.mkdir(path, parents=True),
         exec_checked_nonzero=session._exec_checked_nonzero,
         apply_entry=lambda artifact, dest, base_dir: artifact.apply(session, dest, base_dir),
-        apply_file_batch=lambda entries, base_dir: File.apply_batch(session, entries, base_dir),
         max_entry_concurrency=max_entry_concurrency,
     )
 

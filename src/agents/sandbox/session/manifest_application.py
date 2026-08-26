@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from ...run_config import DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY
-from ..entries import BaseEntry, Dir, File, Mount, resolve_workspace_path
+from ..entries import BaseEntry, Dir, Mount, resolve_workspace_path
 from ..manifest import Manifest
 from ..materialization import MaterializationResult, MaterializedFile, gather_in_order
 from ..types import ExecResult, User
@@ -18,13 +18,6 @@ class ManifestApplier:
         mkdir: Callable[[Path], Awaitable[None]],
         exec_checked_nonzero: Callable[..., Awaitable[ExecResult]],
         apply_entry: Callable[[BaseEntry, Path, Path], Awaitable[list[MaterializedFile]]],
-        apply_file_batch: (
-            Callable[
-                [Sequence[tuple[Path, File]], Path],
-                Awaitable[list[MaterializedFile]],
-            ]
-            | None
-        ) = None,
         max_entry_concurrency: int | None = DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY,
     ) -> None:
         if max_entry_concurrency is not None and max_entry_concurrency < 1:
@@ -32,7 +25,6 @@ class ManifestApplier:
         self._mkdir = mkdir
         self._exec_checked_nonzero = exec_checked_nonzero
         self._apply_entry = apply_entry
-        self._apply_file_batch = apply_file_batch
         self._max_entry_concurrency = max_entry_concurrency
 
     async def apply_manifest(
@@ -163,39 +155,8 @@ class ManifestApplier:
 
                 return _apply
 
-            batch = list(parallel_batch)
+            tasks = [_make_apply_task(dest, artifact) for dest, artifact in parallel_batch]
             parallel_batch.clear()
-            if self._apply_file_batch is None:
-                individual_tasks = [_make_apply_task(dest, artifact) for dest, artifact in batch]
-                batch_files = await gather_in_order(
-                    individual_tasks,
-                    max_concurrency=self._max_entry_concurrency,
-                )
-                for entry_files in batch_files:
-                    files.extend(entry_files)
-                return
-
-            file_entries = [
-                (dest, artifact) for dest, artifact in batch if isinstance(artifact, File)
-            ]
-
-            def _make_file_batch_task() -> Callable[[], Awaitable[list[MaterializedFile]]]:
-                async def _apply() -> list[MaterializedFile]:
-                    assert self._apply_file_batch is not None
-                    return await self._apply_file_batch(file_entries, base_dir)
-
-                return _apply
-
-            tasks: list[Callable[[], Awaitable[list[MaterializedFile]]]] = []
-            file_batch_added = False
-            for dest, artifact in batch:
-                if not isinstance(artifact, File):
-                    tasks.append(_make_apply_task(dest, artifact))
-                elif len(file_entries) == 1:
-                    tasks.append(_make_apply_task(dest, artifact))
-                elif not file_batch_added:
-                    tasks.append(_make_file_batch_task())
-                    file_batch_added = True
             batch_files = await gather_in_order(
                 tasks,
                 max_concurrency=self._max_entry_concurrency,

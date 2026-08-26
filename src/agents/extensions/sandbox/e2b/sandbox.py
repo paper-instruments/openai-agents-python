@@ -50,7 +50,6 @@ from ....sandbox.errors import (
 )
 from ....sandbox.files import EntryKind, FileEntry
 from ....sandbox.manifest import Manifest
-from ....sandbox.materialization import gather_in_order
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
@@ -1849,20 +1848,13 @@ class E2BSandboxSession(BaseSandboxSession):
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
             raise WorkspaceArchiveWriteError(path=workspace_path, cause=e) from e
 
-    async def _write_file_batch(self, files: Sequence[tuple[Path, bytes]]) -> None:
-        def _make_validate_task(path: Path) -> Callable[[], Awaitable[Path]]:
-            async def _validate() -> Path:
-                return await self._validate_path_access(path, for_write=True)
-
-            return _validate
-
-        workspace_paths = await gather_in_order(
-            [_make_validate_task(path) for path, _ in files],
-            max_concurrency=self._max_manifest_entry_concurrency,
-        )
+    async def _write_file_batch_immediately(
+        self,
+        files: Sequence[tuple[Path, bytes]],
+    ) -> None:
+        """Write manifest-resolved paths in one E2B request without revalidating remotely."""
         payload: list[dict[str, object]] = [
-            {"path": sandbox_path_str(path), "data": content}
-            for path, (_, content) in zip(workspace_paths, files, strict=True)
+            {"path": sandbox_path_str(path), "data": content} for path, content in files
         ]
 
         try:
@@ -1873,10 +1865,10 @@ class E2BSandboxSession(BaseSandboxSession):
             )
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
             raise WorkspaceArchiveWriteError(
-                path=workspace_paths[0],
+                path=files[0][0],
                 context={
-                    "file_count": len(workspace_paths),
-                    "paths": [sandbox_path_str(path) for path in workspace_paths],
+                    "file_count": len(files),
+                    "paths": [sandbox_path_str(path) for path, _ in files],
                 },
                 cause=e,
             ) from e
