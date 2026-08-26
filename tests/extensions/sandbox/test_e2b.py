@@ -70,6 +70,7 @@ from agents.sandbox.session.runtime_helpers import (
     RESOLVE_WORKSPACE_PATH_HELPER,
     WORKSPACE_FINGERPRINT_HELPER,
 )
+from agents.sandbox.session.sandbox_session import SandboxSession
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExecResult, User
 from agents.sandbox.workspace_paths import SandboxPathGrant
@@ -1378,13 +1379,14 @@ async def test_e2b_manifest_bulk_write_skips_remote_path_validation(
 
 
 @pytest.mark.asyncio
-async def test_e2b_manifest_uses_one_bulk_write_across_nested_directories() -> None:
-    session, sandbox = _session(workspace_root_ready=True)
+async def test_e2b_wrapped_live_manifest_uses_one_bulk_write_across_nested_directories() -> None:
+    inner, sandbox = _session(workspace_root_ready=True)
+    session = SandboxSession(inner)
     sandbox.commands.exec_root_ready = True
-    session.state.manifest = Manifest(
-        root="/workspace",
-        entries={
-            ".agents/alpha": Dir(
+    entries = [
+        (
+            Path("/workspace/.agents/alpha"),
+            Dir(
                 children={
                     "SKILL.md": File(content=b"alpha"),
                     "references": Dir(
@@ -1395,19 +1397,22 @@ async def test_e2b_manifest_uses_one_bulk_write_across_nested_directories() -> N
                     ),
                 }
             ),
-            ".agents/beta": Dir(
+        ),
+        (
+            Path("/workspace/.agents/beta"),
+            Dir(
                 children={"SKILL.md": File(content=b"beta")},
             ),
-        },
-    )
+        ),
+    ]
 
-    result = await session.apply_manifest()
+    result = await session._apply_entry_batch(entries, base_dir=Path("/"))
 
-    assert result.files == []
+    assert result == []
     assert sandbox.files.write_calls == []
     assert len(sandbox.files.write_files_calls) == 1
     uploaded_files, request_timeout = sandbox.files.write_files_calls[0]
-    assert request_timeout == session.state.timeouts.file_upload_s
+    assert request_timeout == inner.state.timeouts.file_upload_s
     assert {str(file["path"]): file["data"] for file in uploaded_files} == {
         "/workspace/.agents/alpha/SKILL.md": b"alpha",
         "/workspace/.agents/alpha/references/one.md": b"one",

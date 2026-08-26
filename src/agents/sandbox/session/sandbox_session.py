@@ -4,7 +4,7 @@ import io
 import ipaddress
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
@@ -624,6 +624,12 @@ class SandboxSession(BaseSandboxSession):
         user: str | User | None = None,
     ) -> None:
         await self._inner.write(path, data, user=user)
+
+    async def _write_file_batch(
+        self,
+        files: Sequence[tuple[Path, bytes]],
+    ) -> None:
+        await self._inner._write_file_batch(files)
 
     @instrumented_op(
         "running",
