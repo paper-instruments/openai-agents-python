@@ -31,6 +31,7 @@ from ..errors import (
     ExecNonZeroError,
     ExecTimeoutError,
     ExecTransportError,
+    PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
@@ -71,6 +72,7 @@ _DEFAULT_MANIFEST_ROOT = cast(str, Manifest.model_fields["root"].default)
 _PTY_READ_CHUNK_BYTES = 16_384
 _PTY_CHILD_SIGNAL_DEFAULTS = (signal.SIGINT, signal.SIGQUIT)
 _PTY_FD_CLOSE_GRACE_SECONDS = 0.1
+_PTY_PROCESS_EXIT_GRACE_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,7 @@ class _UnixPtyProcessEntry:
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
     output_closed: asyncio.Event = field(default_factory=asyncio.Event)
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pump_tasks: list[asyncio.Task[None]] = field(default_factory=list)
     wait_task: asyncio.Task[None] | None = None
 
@@ -382,34 +385,75 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
-        if chars:
-            if not entry.tty or entry.primary_fd is None:
-                raise RuntimeError("stdin is not available for this process")
-            try:
-                os.write(entry.primary_fd, chars.encode("utf-8"))
-            except OSError as e:
-                if e.errno not in {
-                    errno.EIO,
-                    errno.EBADF,
-                    errno.EPIPE,
-                    errno.ECONNRESET,
-                }:
-                    raise
-            await asyncio.sleep(0.1)
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_processes.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
 
-        yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=resolve_pty_write_yield_time_ms(
-                yield_time_ms=yield_time_ms, input_empty=chars == ""
-            ),
-            max_output_tokens=max_output_tokens,
-        )
-        entry.last_used = time.monotonic()
-        return await self._finalize_pty_update(
-            process_id=session_id,
-            entry=entry,
+            if chars:
+                if not entry.tty or entry.primary_fd is None:
+                    raise RuntimeError("stdin is not available for this process")
+                try:
+                    os.write(entry.primary_fd, chars.encode("utf-8"))
+                except OSError as e:
+                    if e.errno not in {
+                        errno.EIO,
+                        errno.EBADF,
+                        errno.EPIPE,
+                        errno.ECONNRESET,
+                    }:
+                        raise
+                await asyncio.sleep(0.1)
+
+            yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=resolve_pty_write_yield_time_ms(
+                    yield_time_ms=yield_time_ms, input_empty=chars == ""
+                ),
+                max_output_tokens=max_output_tokens,
+            )
+            entry.last_used = time.monotonic()
+            return await self._finalize_pty_update(
+                process_id=session_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
+
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        async with self._pty_lock:
+            entry = self._resolve_pty_session_entry(
+                pty_processes=self._pty_processes,
+                session_id=session_id,
+            )
+
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_processes.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+
+            await self._terminate_pty_entry(entry)
+            if entry.process.returncode is None:
+                await asyncio.wait_for(
+                    entry.process.wait(),
+                    timeout=_PTY_PROCESS_EXIT_GRACE_SECONDS,
+                )
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=0,
+                max_output_tokens=None,
+            )
+            async with self._pty_lock:
+                if self._pty_processes.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+                self._pty_processes.pop(session_id)
+                self._reserved_pty_process_ids.discard(session_id)
+
+        return PtyExecUpdate(
+            process_id=None,
             output=output,
+            exit_code=entry.process.returncode,
             original_token_count=original_token_count,
         )
 

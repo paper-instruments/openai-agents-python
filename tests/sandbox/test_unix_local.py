@@ -249,6 +249,48 @@ class TestUnixLocalPty:
         with pytest.raises(PtySessionNotFoundError):
             await session.pty_write_stdin(session_id=started.process_id, chars="")
 
+    @pytest.mark.asyncio
+    async def test_pty_terminate_stops_only_requested_session(self, tmp_path: Path) -> None:
+        client = UnixLocalSandboxClient()
+        manifest = Manifest(root=str(tmp_path / "workspace"))
+
+        async with await client.create(manifest=manifest, snapshot=None, options=None) as session:
+            terminated_process = await session.pty_exec_start(
+                "sleep",
+                "30",
+                shell=False,
+                tty=False,
+                yield_time_s=0.05,
+            )
+            interactive_process = await session.pty_exec_start(
+                "sh",
+                "-c",
+                "IFS= read -r line; printf '%s\\n' \"$line\"",
+                shell=False,
+                tty=True,
+                yield_time_s=0.05,
+            )
+
+            assert terminated_process.process_id is not None
+            assert interactive_process.process_id is not None
+
+            terminated = await session.pty_terminate(terminated_process.process_id)
+
+            assert terminated.process_id is None
+            assert terminated.exit_code is not None
+
+            interactive_finished = await session.pty_write_stdin(
+                session_id=interactive_process.process_id,
+                chars="still running\n",
+                yield_time_s=0.25,
+            )
+            assert interactive_finished.process_id is None
+            assert interactive_finished.exit_code == 0
+            assert "still running" in interactive_finished.output.decode("utf-8", errors="replace")
+
+            with pytest.raises(PtySessionNotFoundError):
+                await session.pty_terminate(terminated_process.process_id)
+
 
 class TestUnixLocalUserScopedFilesystem:
     @pytest.mark.asyncio
