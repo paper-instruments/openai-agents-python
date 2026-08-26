@@ -1359,7 +1359,7 @@ async def test_e2b_manifest_bulk_write_skips_remote_path_validation(
 
     monkeypatch.setattr(session, "_validate_path_access", fail_validation)
 
-    await session._write_file_batch_immediately(
+    await session._write_file_batch(
         [
             (Path("/workspace/.agents/alpha/SKILL.md"), b"alpha"),
             (Path("/workspace/.agents/beta/SKILL.md"), b"beta"),

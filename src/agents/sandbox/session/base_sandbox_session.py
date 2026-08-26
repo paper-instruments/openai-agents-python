@@ -1305,15 +1305,15 @@ class BaseSandboxSession(abc.ABC):
             async with self._batch_file_writes():
                 return await manifest_ops.apply_entry_batch(self, entries, base_dir=base_dir)
 
-    async def _write_file_batch(self, files: Sequence[tuple[Path, bytes]]) -> None:
+    async def _stage_file_write(self, path: Path, content: bytes) -> None:
         pending = self._pending_file_writes
         if self._file_write_batch_depth > 0 and pending is not None:
-            pending.extend(files)
+            pending.append((path, content))
             return
 
-        await self._write_file_batch_immediately(files)
+        await self._write_file_batch([(path, content)])
 
-    async def _write_file_batch_immediately(
+    async def _write_file_batch(
         self,
         files: Sequence[tuple[Path, bytes]],
     ) -> None:
@@ -1345,7 +1345,7 @@ class BaseSandboxSession(abc.ABC):
                 pending = self._pending_file_writes or []
                 self._pending_file_writes = None
                 if pending:
-                    await self._write_file_batch_immediately(pending)
+                    await self._write_file_batch(pending)
         finally:
             self._file_write_batch_depth -= 1
 

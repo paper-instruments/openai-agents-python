@@ -63,12 +63,12 @@ class _RecordingSession(BaseSandboxSession):
         _ = user
         self.writes[path] = data.read()
 
-    async def _write_file_batch_immediately(
+    async def _write_file_batch(
         self,
         files: Sequence[tuple[Path, bytes]],
     ) -> None:
         self.write_batches.append(list(files))
-        await super()._write_file_batch_immediately(files)
+        await super()._write_file_batch(files)
 
     async def running(self) -> bool:
         return True

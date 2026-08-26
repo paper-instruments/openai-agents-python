@@ -1848,7 +1848,7 @@ class E2BSandboxSession(BaseSandboxSession):
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
             raise WorkspaceArchiveWriteError(path=workspace_path, cause=e) from e
 
-    async def _write_file_batch_immediately(
+    async def _write_file_batch(
         self,
         files: Sequence[tuple[Path, bytes]],
     ) -> None:
