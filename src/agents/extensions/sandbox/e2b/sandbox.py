@@ -50,6 +50,7 @@ from ....sandbox.errors import (
 )
 from ....sandbox.files import EntryKind, FileEntry
 from ....sandbox.manifest import Manifest
+from ....sandbox.materialization import gather_in_order
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
@@ -437,6 +438,13 @@ class _E2BFilesAPI:
     ) -> object:
         raise NotImplementedError
 
+    async def write_files(
+        self,
+        files: Sequence[dict[str, object]],
+        request_timeout: float | None = None,
+    ) -> object:
+        raise NotImplementedError
+
     async def remove(self, path: str, request_timeout: float | None = None) -> object:
         raise NotImplementedError
 
@@ -617,6 +625,18 @@ async def _sandbox_write_file(
     return await _as_sandbox_api(sandbox).files.write(
         path,
         data,
+        request_timeout=request_timeout,
+    )
+
+
+async def _sandbox_write_files(
+    sandbox: object,
+    files: Sequence[dict[str, object]],
+    *,
+    request_timeout: float | None = None,
+) -> object:
+    return await _as_sandbox_api(sandbox).files.write_files(
+        files,
         request_timeout=request_timeout,
     )
 
@@ -1828,6 +1848,38 @@ class E2BSandboxSession(BaseSandboxSession):
             )
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
             raise WorkspaceArchiveWriteError(path=workspace_path, cause=e) from e
+
+    async def _write_file_batch(self, files: Sequence[tuple[Path, bytes]]) -> None:
+        def _make_validate_task(path: Path) -> Callable[[], Awaitable[Path]]:
+            async def _validate() -> Path:
+                return await self._validate_path_access(path, for_write=True)
+
+            return _validate
+
+        workspace_paths = await gather_in_order(
+            [_make_validate_task(path) for path, _ in files],
+            max_concurrency=self._max_manifest_entry_concurrency,
+        )
+        payload: list[dict[str, object]] = [
+            {"path": sandbox_path_str(path), "data": content}
+            for path, (_, content) in zip(workspace_paths, files, strict=True)
+        ]
+
+        try:
+            await _sandbox_write_files(
+                self._sandbox,
+                payload,
+                request_timeout=self.state.timeouts.file_upload_s,
+            )
+        except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
+            raise WorkspaceArchiveWriteError(
+                path=workspace_paths[0],
+                context={
+                    "file_count": len(workspace_paths),
+                    "paths": [sandbox_path_str(path) for path in workspace_paths],
+                },
+                cause=e,
+            ) from e
 
     async def running(self) -> bool:
         if not self._workspace_root_ready:

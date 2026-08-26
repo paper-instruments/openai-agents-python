@@ -28,7 +28,7 @@ from ..errors import (
 )
 from ..files import EntryKind, FileEntry
 from ..manifest import Manifest
-from ..materialization import MaterializationResult, MaterializedFile
+from ..materialization import MaterializationResult, MaterializedFile, gather_in_order
 from ..types import ExecResult, ExposedPortEndpoint, User
 from ..util.parse_utils import parse_ls_la
 from ..workspace_paths import (
@@ -1295,6 +1295,18 @@ class BaseSandboxSession(abc.ABC):
         base_dir: Path,
     ) -> list[MaterializedFile]:
         return await manifest_ops.apply_entry_batch(self, entries, base_dir=base_dir)
+
+    async def _write_file_batch(self, files: Sequence[tuple[Path, bytes]]) -> None:
+        def _make_write_task(path: Path, content: bytes) -> Callable[[], Awaitable[None]]:
+            async def _write() -> None:
+                await self.write(path, io.BytesIO(content))
+
+            return _write
+
+        await gather_in_order(
+            [_make_write_task(path, content) for path, content in files],
+            max_concurrency=self._max_manifest_entry_concurrency,
+        )
 
     def _manifest_base_dir(self) -> Path:
         return Path.cwd()

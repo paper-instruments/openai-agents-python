@@ -15,6 +15,7 @@ import sys
 import tarfile
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, cast
 
@@ -40,6 +41,7 @@ from agents.extensions.sandbox.e2b.sandbox import (
 from agents.sandbox import Manifest
 from agents.sandbox.entries import (
     Dir,
+    File,
     InContainerMountStrategy,
     Mount,
     MountpointMountPattern,
@@ -425,6 +427,8 @@ class _FakeE2BFiles:
     def __init__(self) -> None:
         self.make_dir_calls: list[tuple[str, float | None]] = []
         self.make_dir_error: BaseException | None = None
+        self.write_calls: list[tuple[str, bytes, float | None]] = []
+        self.write_files_calls: list[tuple[list[dict[str, object]], float | None]] = []
 
     async def write(
         self,
@@ -432,7 +436,14 @@ class _FakeE2BFiles:
         data: bytes,
         request_timeout: float | None = None,
     ) -> None:
-        _ = (path, data, request_timeout)
+        self.write_calls.append((path, data, request_timeout))
+
+    async def write_files(
+        self,
+        files: Sequence[dict[str, object]],
+        request_timeout: float | None = None,
+    ) -> None:
+        self.write_files_calls.append((list(files), request_timeout))
 
     async def remove(self, path: str, request_timeout: float | None = None) -> None:
         _ = (path, request_timeout)
@@ -1308,6 +1319,33 @@ def _tar_bytes() -> bytes:
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
     return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_e2b_manifest_uses_native_bulk_write_for_files() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    session.state.manifest = Manifest(
+        root="/workspace",
+        entries={
+            "skills/alpha.md": File(content=b"alpha"),
+            "skills/beta.md": File(content=b"beta"),
+        },
+    )
+
+    result = await session.apply_manifest()
+
+    assert result.files == []
+    assert sandbox.files.write_calls == []
+    assert sandbox.files.write_files_calls == [
+        (
+            [
+                {"path": "/workspace/skills/alpha.md", "data": b"alpha"},
+                {"path": "/workspace/skills/beta.md", "data": b"beta"},
+            ],
+            session.state.timeouts.file_upload_s,
+        )
+    ]
 
 
 @pytest.mark.asyncio

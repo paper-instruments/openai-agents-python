@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Literal
 
@@ -101,6 +101,31 @@ class File(BaseEntry):
     ) -> list[MaterializedFile]:
         await session.write(dest, io.BytesIO(self.content))
         await self._apply_metadata(session, dest)
+        return []
+
+    @classmethod
+    async def apply_batch(
+        cls,
+        session: BaseSandboxSession,
+        entries: Sequence[tuple[Path, File]],
+        base_dir: Path,
+    ) -> list[MaterializedFile]:
+        _ = base_dir
+        await session._write_file_batch([(dest, artifact.content) for dest, artifact in entries])
+
+        def _make_metadata_task(
+            dest: Path,
+            artifact: File,
+        ) -> Callable[[], Awaitable[None]]:
+            async def _apply_metadata() -> None:
+                await artifact._apply_metadata(session, dest)
+
+            return _apply_metadata
+
+        await gather_in_order(
+            [_make_metadata_task(dest, artifact) for dest, artifact in entries],
+            max_concurrency=session._max_manifest_entry_concurrency,
+        )
         return []
 
 
