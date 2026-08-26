@@ -182,7 +182,7 @@ async def test_runner_can_call_server_prefixed_mcp_tool_names(streaming: bool):
 
     model.add_multiple_turn_outputs(
         [
-            [get_text_message("a_message"), get_function_tool_call("mcp_calendar__search", "")],
+            [get_text_message("a_message"), get_function_tool_call("mcp__calendar__search", "")],
             [get_text_message("done")],
         ]
     )
@@ -214,7 +214,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_agent_tools(st
         return "local"
 
     local_tool = FunctionTool(
-        name="mcp_calendar__search",
+        name="mcp__calendar__search",
         description="Local tool that intentionally collides with the natural MCP prefix.",
         params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
         on_invoke_tool=invoke_local_tool,
@@ -235,8 +235,8 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_agent_tools(st
         for tool in mcp_tools
         if getattr(getattr(tool, "_tool_origin", None), "mcp_server_name", None) == "calendar"
     )
-    assert calendar_search_tool_name != "mcp_calendar__search"
-    assert calendar_search_tool_name.startswith("mcp_calendar__search_")
+    assert calendar_search_tool_name != "mcp__calendar__search"
+    assert calendar_search_tool_name.startswith("mcp__calendar__search_")
 
     model.add_multiple_turn_outputs(
         [
@@ -271,7 +271,7 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_handoffs(strea
     agent = Agent(
         name="test",
         model=model,
-        handoffs=[handoff(target_agent, tool_name_override="mcp_calendar__search")],
+        handoffs=[handoff(target_agent, tool_name_override="mcp__calendar__search")],
         mcp_servers=[server],
         mcp_config={"include_server_in_tool_names": True},
     )
@@ -279,8 +279,8 @@ async def test_runner_prefixed_mcp_tool_names_do_not_collide_with_handoffs(strea
     mcp_tools = await agent.get_mcp_tools(RunContextWrapper(context=None))
     assert len(mcp_tools) == 1
     calendar_search_tool_name = mcp_tools[0].name
-    assert calendar_search_tool_name != "mcp_calendar__search"
-    assert calendar_search_tool_name.startswith("mcp_calendar__search_")
+    assert calendar_search_tool_name != "mcp__calendar__search"
+    assert calendar_search_tool_name.startswith("mcp__calendar__search_")
 
     model.add_multiple_turn_outputs(
         [

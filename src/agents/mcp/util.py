@@ -435,7 +435,7 @@ class MCPUtil:
     def _build_prefixed_tool_base_name(cls, server_name: str, tool_name: str) -> str:
         server_part = cls._safe_tool_name_part(server_name, "server")
         tool_part = cls._safe_tool_name_part(tool_name, "tool")
-        return f"mcp_{server_part}__{tool_part}"
+        return f"mcp__{server_part}__{tool_part}"
 
     @classmethod
     def _build_prefixed_tool_name_overrides(

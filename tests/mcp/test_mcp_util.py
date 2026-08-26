@@ -184,10 +184,10 @@ async def test_get_all_function_tools_can_prefix_server_tool_names():
 
     tool_names = [tool.name for tool in tools]
     assert tool_names == [
-        "mcp_docs__search",
-        "mcp_docs__fetch",
-        "mcp_calendar__search",
-        "mcp_calendar__update",
+        "mcp__docs__search",
+        "mcp__docs__fetch",
+        "mcp__calendar__search",
+        "mcp__calendar__update",
     ]
 
     calendar_search_tool = tools[2]
@@ -226,7 +226,7 @@ async def test_get_all_function_tools_prefixes_non_ascii_server_names_safely():
     )
 
     assert len(tools) == 1
-    assert tools[0].name == "mcp_server__search"
+    assert tools[0].name == "mcp__server__search"
     assert all(char.isascii() and (char.isalnum() or char in {"_", "-"}) for char in tools[0].name)
     assert len(tools[0].name) <= 64
 
@@ -250,7 +250,7 @@ async def test_get_all_function_tools_prefixes_non_ascii_tool_names_safely():
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, FunctionTool)
-    assert tool.name == "mcp_docs__tool"
+    assert tool.name == "mcp__docs__tool"
     assert all(char.isascii() and (char.isalnum() or char in {"_", "-"}) for char in tool.name)
     assert len(tool.name) <= 64
 
@@ -319,9 +319,9 @@ async def test_get_all_function_tools_prefixes_normalized_server_name_collisions
     tool_names = [tool.name for tool in tools]
     assert len(tool_names) == 3
     assert len(set(tool_names)) == 3
-    assert "mcp_foo__create_issue" not in tool_names
-    assert "mcp_foo_0beec7b5__create_issue" in tool_names
-    assert sum(name.startswith("mcp_foo__create_issue_") for name in tool_names) == 2
+    assert "mcp__foo__create_issue" not in tool_names
+    assert "mcp__foo_0beec7b5__create_issue" in tool_names
+    assert sum(name.startswith("mcp__foo__create_issue_") for name in tool_names) == 2
     assert all(len(name) <= 64 for name in tool_names)
     assert all(
         char.isascii() and (char.isalnum() or char in {"_", "-"})
@@ -356,9 +356,9 @@ async def test_get_all_function_tools_prefixes_normalized_tool_collisions_stably
 
     assert first_order == reversed_order
     assert set(first_order) == {"search", "search!"}
-    assert "mcp_docs__search" not in first_order.values()
+    assert "mcp__docs__search" not in first_order.values()
     assert len(set(first_order.values())) == 2
-    assert all(name.startswith("mcp_docs__search_") for name in first_order.values())
+    assert all(name.startswith("mcp__docs__search_") for name in first_order.values())
     assert all(len(name) <= 64 for name in first_order.values())
 
 
@@ -390,9 +390,9 @@ async def test_get_all_function_tools_prefixes_normalized_server_collisions_stab
 
     assert first_order == reversed_order
     assert set(first_order) == {"foo", "foo!"}
-    assert "mcp_foo__create_issue" not in first_order.values()
+    assert "mcp__foo__create_issue" not in first_order.values()
     assert len(set(first_order.values())) == 2
-    assert all(name.startswith("mcp_foo__create_issue_") for name in first_order.values())
+    assert all(name.startswith("mcp__foo__create_issue_") for name in first_order.values())
     assert all(len(name) <= 64 for name in first_order.values())
 
 
@@ -410,14 +410,14 @@ async def test_get_all_function_tools_reserves_existing_tool_names_when_prefixin
         run_context,
         agent,
         include_server_in_tool_names=True,
-        reserved_tool_names={"mcp_docs__search"},
+        reserved_tool_names={"mcp__docs__search"},
     )
 
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, FunctionTool)
-    assert tool.name != "mcp_docs__search"
-    assert tool.name.startswith("mcp_docs__search_")
+    assert tool.name != "mcp__docs__search"
+    assert tool.name.startswith("mcp__docs__search_")
     assert len(tool.name) <= 64
 
     tool_context = ToolContext(
@@ -439,7 +439,7 @@ async def test_agent_get_mcp_tools_reserves_handoff_tool_names_when_prefixing():
     agent = Agent(
         name="test_agent",
         instructions="Test agent",
-        handoffs=[handoff(handoff_agent, tool_name_override="mcp_calendar__search")],
+        handoffs=[handoff(handoff_agent, tool_name_override="mcp__calendar__search")],
         mcp_servers=[server],
         mcp_config={"include_server_in_tool_names": True},
     )
@@ -449,8 +449,8 @@ async def test_agent_get_mcp_tools_reserves_handoff_tool_names_when_prefixing():
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, FunctionTool)
-    assert tool.name != "mcp_calendar__search"
-    assert tool.name.startswith("mcp_calendar__search_")
+    assert tool.name != "mcp__calendar__search"
+    assert tool.name.startswith("mcp__calendar__search_")
     assert len(tool.name) <= 64
 
     tool_context = ToolContext(
@@ -490,7 +490,7 @@ async def test_agent_get_mcp_tools_ignores_disabled_handoff_tool_names_when_pref
         handoffs=[
             handoff(
                 handoff_agent,
-                tool_name_override="mcp_calendar__search",
+                tool_name_override="mcp__calendar__search",
                 is_enabled=False,
             )
         ],
@@ -501,7 +501,7 @@ async def test_agent_get_mcp_tools_ignores_disabled_handoff_tool_names_when_pref
     tools = await agent.get_mcp_tools(RunContextWrapper(context=None))
 
     assert len(tools) == 1
-    assert tools[0].name == "mcp_calendar__search"
+    assert tools[0].name == "mcp__calendar__search"
 
 
 @pytest.mark.asyncio
