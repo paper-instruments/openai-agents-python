@@ -156,9 +156,15 @@ class _FakeProcess:
             await asyncio.sleep(self.delay)
         name = config.get("name")
         if name and config.get("wait_for_completion") is False:
-            sequence = self.next_process_sequence or [
-                _FakeExecResult(name=str(name), status="running", exit_code=0)
-            ]
+            if self.next_process_sequence:
+                sequence = self.next_process_sequence
+            elif self._results_queue:
+                sequence = [self._results_queue.pop(0)]
+            elif str(name).startswith("openai-agents-exec-"):
+                sequence = [self.next_result]
+                self.next_result = _FakeExecResult()
+            else:
+                sequence = [_FakeExecResult(name=str(name), status="running", exit_code=0)]
             self.next_process_sequence = []
             self.process_sequences[str(name)] = sequence
             return sequence[0]
@@ -582,7 +588,7 @@ async def test_blaxel_stat_passes_optional_user_through_provider_exec(
     assert result is not None
     assert result.kind is EntryKind.OTHER
     config, _kwargs = fake_sandbox.process.exec_calls[-1]
-    assert shlex.split(str(config["command"]))[:4] == ["sudo", "-u", "runner", "--"]
+    assert shlex.split(str(config["command"]))[4:8] == ["sudo", "-u", "runner", "--"]
 
 
 @pytest.mark.asyncio
@@ -623,6 +629,32 @@ class TestBlaxelSandboxSession:
         assert result.exit_code == 0
         assert result.stdout == b"hello world"
         assert len(fake_sandbox.process.exec_calls) == 1
+        launch, _kwargs = fake_sandbox.process.exec_calls[0]
+        assert launch["wait_for_completion"] is False
+        assert str(launch["name"]).startswith("openai-agents-exec-")
+
+    @pytest.mark.asyncio
+    async def test_exec_polls_one_named_process_without_relaunching(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running"),
+            _FakeExecResult(status="completed", output="finished", exit_code=0),
+        ]
+        session = _make_session(fake_sandbox)
+
+        result = await session._exec_internal("slow-command", timeout=1)
+
+        assert result.stdout == b"finished"
+        assert result.stderr == b""
+        assert result.exit_code == 0
+        launches = [
+            config
+            for config, _kwargs in fake_sandbox.process.exec_calls
+            if str(config.get("name", "")).startswith("openai-agents-exec-")
+        ]
+        assert len(launches) == 1
+        assert fake_sandbox.process.get_calls == [launches[0]["name"], launches[0]["name"]]
 
     @pytest.mark.asyncio
     async def test_exec_success_preserves_split_stderr(
@@ -887,9 +919,17 @@ class TestBlaxelSandboxSession:
     @pytest.mark.asyncio
     async def test_exec_timeout(self, fake_sandbox: _FakeSandboxInstance) -> None:
         session = _make_session(fake_sandbox)
-        fake_sandbox.process.delay = 10.0
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
         with pytest.raises(ExecTimeoutError):
             await session._exec_internal("sleep", "100", timeout=0.01)
+
+        launches = [
+            config
+            for config, _kwargs in fake_sandbox.process.exec_calls
+            if str(config.get("name", "")).startswith("openai-agents-exec-")
+        ]
+        assert len(launches) == 1
+        assert fake_sandbox.process.kill_calls == [launches[0]["name"]]
 
     @pytest.mark.asyncio
     async def test_exec_timeout_reports_default_timeout(
@@ -900,7 +940,7 @@ class TestBlaxelSandboxSession:
         state = _make_state()
         state.timeouts = BlaxelTimeouts(exec_timeout_s=1)
         session = _make_session(fake_sandbox, state=state)
-        fake_sandbox.process.delay = 10.0
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
 
         with pytest.raises(ExecTimeoutError) as exc_info:
             await session._exec_internal("sleep", "100")
@@ -2978,7 +3018,7 @@ class TestFinalCoverageGaps:
             )
             if helper_result is not None:
                 return helper_result
-            if "rm" in command:
+            if shlex.split(command)[4:5] == ["rm"]:
                 raise OSError("rm failed")
             return _FakeExecResult(exit_code=0, output="")
 
@@ -3004,7 +3044,7 @@ class TestFinalCoverageGaps:
             )
             if helper_result is not None:
                 return helper_result
-            if "rm" in command:
+            if shlex.split(command)[4:5] == ["rm"]:
                 raise OSError("rm failed")
             return _FakeExecResult(exit_code=0, output="")
 

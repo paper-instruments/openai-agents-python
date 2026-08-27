@@ -346,6 +346,26 @@ def _blaxel_exec_transport_error(
     )
 
 
+def _exec_result_from_blaxel_process(process: Any) -> ExecResult:
+    exit_code = int(getattr(process, "exit_code", 0) or 0)
+    has_split_streams = hasattr(process, "stdout") or hasattr(process, "stderr")
+    stdout = str(getattr(process, "stdout", "") or "")
+    stderr = str(getattr(process, "stderr", "") or "")
+    fallback = str(getattr(process, "logs", "") or getattr(process, "output", "") or "")
+
+    if has_split_streams:
+        return ExecResult(
+            stdout=stdout.encode("utf-8", errors="replace"),
+            stderr=stderr.encode("utf-8", errors="replace"),
+            exit_code=exit_code,
+        )
+
+    fallback_bytes = fallback.encode("utf-8", errors="replace")
+    if exit_code == 0:
+        return ExecResult(stdout=fallback_bytes, stderr=b"", exit_code=exit_code)
+    return ExecResult(stdout=b"", stderr=fallback_bytes, exit_code=exit_code)
+
+
 def _import_blaxel_sdk() -> Any:
     """Lazily import SandboxInstance from the Blaxel SDK, raising a clear error if missing."""
     try:
@@ -734,59 +754,83 @@ class BlaxelSandboxSession(BaseSandboxSession):
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
-        cmd_str = shlex.join(str(c) for c in command)
         cwd = self.state.manifest.root
         exec_timeout = self._coerce_exec_timeout(timeout)
         timeout_seconds = int(max(1, math.ceil(exec_timeout)))
-
-        # Resolve manifest + base env vars and prepend them so the executed
-        # process sees them.
-        envs = await self._resolved_envs()
-        if envs:
-            env_prefix = " ".join(f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in envs.items())
-            cmd_str = f"env {env_prefix} {cmd_str}"
+        deadline = time.monotonic() + exec_timeout
+        process_name = f"openai-agents-exec-{uuid.uuid4().hex}"
+        process_token = uuid.uuid4().hex
+        envs = {
+            **(await self._resolved_envs()),
+            _BLAXEL_MANAGED_PROCESS_TOKEN_ENV: process_token,
+        }
+        entry = _BlaxelPtySessionEntry(
+            process_name=process_name,
+            tty=False,
+            process_token=process_token,
+        )
 
         try:
             result = await asyncio.wait_for(
                 self._sandbox.process.exec(
                     {
-                        "command": cmd_str,
+                        "name": process_name,
+                        "command": _blaxel_supervised_command(command),
+                        "env": envs,
                         "working_dir": cwd,
-                        "wait_for_completion": True,
+                        "wait_for_completion": False,
                         "timeout": timeout_seconds,
                     }
                 ),
-                timeout=exec_timeout,
+                timeout=min(self.state.timeouts.fast_op_s, exec_timeout),
             )
-
-            exit_code = int(getattr(result, "exit_code", 0) or 0)
-            # Blaxel ProcessResponse uses .stdout / .stderr / .logs attributes. Prefer
-            # split streams when available, and only fall back to logs/output for older SDKs.
-            has_split_streams = hasattr(result, "stdout") or hasattr(result, "stderr")
-            stdout = str(getattr(result, "stdout", "") or "")
-            stderr = str(getattr(result, "stderr", "") or "")
-            fallback = str(getattr(result, "logs", "") or getattr(result, "output", "") or "")
-            stdout_bytes = stdout.encode("utf-8", errors="replace")
-            stderr_bytes = stderr.encode("utf-8", errors="replace")
-
-            if has_split_streams:
-                return ExecResult(stdout=stdout_bytes, stderr=stderr_bytes, exit_code=exit_code)
-
-            fallback_bytes = fallback.encode("utf-8", errors="replace")
-            if exit_code == 0:
-                return ExecResult(stdout=fallback_bytes, stderr=b"", exit_code=exit_code)
-            return ExecResult(stdout=b"", stderr=fallback_bytes, exit_code=exit_code)
+            status = getattr(result, "status", "running")
+            status_value = getattr(status, "value", status)
+            if str(status_value).lower() == "running":
+                result = await asyncio.wait_for(
+                    self._wait_for_named_process(process_name),
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+            return _exec_result_from_blaxel_process(result)
         except asyncio.TimeoutError as e:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
             raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
+        except asyncio.CancelledError:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
+            raise
         except (ExecTimeoutError, ExecTransportError):
             raise
         except Exception as e:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
             api_error_cls = _import_sandbox_api_error()
             if api_error_cls is not None and isinstance(e, api_error_cls):
                 status = getattr(e, "status_code", None)
                 if status in (408, 504):
                     raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
+
+    async def _wait_for_named_process(self, process_name: str) -> Any:
+        while True:
+            process = await self._sandbox.process.get(process_name)
+            status = getattr(process, "status", "running")
+            status_value = getattr(status, "value", status)
+            if str(status_value).lower() != "running":
+                return process
+            await asyncio.sleep(_BLAXEL_PROCESS_STATUS_POLL_S)
+
+    async def _cleanup_named_exec(
+        self,
+        entry: _BlaxelPtySessionEntry,
+        *,
+        reconcile_late_start: bool,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._terminate_pty_entry(
+                entry,
+                reconcile_late_start=reconcile_late_start,
+            )
+        )
+        await await_task_ignoring_cancellation(cleanup_task)
 
     async def stat(
         self,
