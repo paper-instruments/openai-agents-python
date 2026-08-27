@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
+import time
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -16,6 +19,7 @@ from agents.sandbox.sandboxes.unix_local import (
     UnixLocalSandboxSessionState,
     _UnixPtyProcessEntry,
 )
+from agents.sandbox.session.pty_types import PTY_PROCESSES_MAX
 from agents.sandbox.snapshot import NoopSnapshot
 from agents.sandbox.types import ExecResult, User
 
@@ -290,6 +294,152 @@ class TestUnixLocalPty:
 
             with pytest.raises(PtySessionNotFoundError):
                 await session.pty_terminate(terminated_process.process_id)
+
+    @pytest.mark.asyncio
+    async def test_pty_terminate_drains_buffered_non_tty_output(self, tmp_path: Path) -> None:
+        session = _RecordingUnixLocalSession(tmp_path)
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            "printf 'buffered stdout'; printf 'buffered stderr' >&2; sleep 30",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        try:
+            # Leave the emitted bytes in the OS pipes until termination begins. The pump tasks
+            # are intentionally created immediately before cleanup so cancelling them first
+            # would deterministically lose the buffered output.
+            await asyncio.sleep(0.05)
+            entry = _UnixPtyProcessEntry(process=process, tty=False)
+            entry.pump_tasks = [
+                asyncio.create_task(session._pump_process_stream(entry, process.stdout)),
+                asyncio.create_task(session._pump_process_stream(entry, process.stderr)),
+            ]
+            entry.wait_task = asyncio.create_task(session._watch_process_exit(entry))
+
+            await session._terminate_pty_entry(entry)
+            output, original_token_count = await session._collect_pty_output(
+                entry=entry,
+                yield_time_ms=0,
+                max_output_tokens=None,
+            )
+
+            assert original_token_count is None
+            assert b"buffered stdout" in output
+            assert b"buffered stderr" in output
+        finally:
+            if process.returncode is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                await process.wait()
+
+    @pytest.mark.asyncio
+    async def test_pty_terminate_wakes_in_flight_empty_poll(self, tmp_path: Path) -> None:
+        session = _RecordingUnixLocalSession(tmp_path)
+        try:
+            started = await session.pty_exec_start(
+                "sleep",
+                "30",
+                shell=False,
+                tty=False,
+                yield_time_s=0.05,
+            )
+            assert started.process_id is not None
+            entry = session._pty_processes[started.process_id]
+
+            poll_task = asyncio.create_task(
+                session.pty_write_stdin(
+                    session_id=started.process_id,
+                    chars="",
+                    yield_time_s=30,
+                )
+            )
+            for _ in range(100):
+                if entry.output_poll_lock.locked():
+                    break
+                await asyncio.sleep(0.01)
+            assert entry.output_poll_lock.locked()
+
+            terminated = await asyncio.wait_for(
+                session.pty_terminate(started.process_id),
+                timeout=2,
+            )
+            polled = await asyncio.wait_for(poll_task, timeout=2)
+
+            assert terminated.process_id is None
+            assert terminated.exit_code is not None
+            assert polled.exit_code is not None
+        finally:
+            await session.pty_terminate_all()
+
+    def test_pty_pruning_skips_terminating_entries(self, tmp_path: Path) -> None:
+        session = _RecordingUnixLocalSession(tmp_path)
+        entries: dict[int, _UnixPtyProcessEntry] = {}
+        for index in range(PTY_PROCESSES_MAX):
+            process = cast(
+                asyncio.subprocess.Process,
+                SimpleNamespace(returncode=None, pid=None),
+            )
+            entry = _UnixPtyProcessEntry(process=process, tty=False)
+            entry.last_used = time.monotonic() - (PTY_PROCESSES_MAX - index)
+            process_id = 1_000 + index
+            entries[process_id] = entry
+
+        entries[1_000].termination_pending = True
+        session._pty_processes = entries
+
+        pruned = session._prune_pty_processes_if_needed()
+
+        assert pruned is not None
+        assert pruned[0] == 1_001
+        assert pruned[1] is entries[1_001]
+        assert entries[1_001].termination_pending is True
+        assert session._pty_processes[1_000] is entries[1_000]
+
+        for entry in entries.values():
+            entry.termination_pending = True
+
+        assert session._prune_pty_processes_if_needed() is None
+
+    @pytest.mark.asyncio
+    async def test_pty_exec_start_rejects_when_all_entries_are_terminating(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session = _RecordingUnixLocalSession(tmp_path)
+        process = cast(
+            asyncio.subprocess.Process,
+            SimpleNamespace(returncode=None, pid=None),
+        )
+        entry = _UnixPtyProcessEntry(
+            process=process,
+            tty=False,
+            termination_pending=True,
+        )
+        session._pty_processes[1_000] = entry
+        session._reserved_pty_process_ids.add(1_000)
+        monkeypatch.setattr(
+            "agents.sandbox.sandboxes.unix_local.PTY_PROCESSES_MAX",
+            1,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="PTY process limit reached while all registered sessions are terminating",
+        ):
+            await session.pty_exec_start(
+                "sleep",
+                "30",
+                shell=False,
+                tty=False,
+                yield_time_s=0.05,
+            )
+
+        assert session._pty_processes == {1_000: entry}
+        assert session._reserved_pty_process_ids == {1_000}
 
 
 class TestUnixLocalUserScopedFilesystem:

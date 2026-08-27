@@ -46,6 +46,7 @@ from ..session import SandboxSession, SandboxSessionState
 from ..session.base_sandbox_session import BaseSandboxSession
 from ..session.dependencies import Dependencies
 from ..session.manager import Instrumentation
+from ..session.pty_lifecycle import await_task_ignoring_cancellation
 from ..session.pty_output import collect_pty_output
 from ..session.pty_types import (
     PTY_PROCESSES_MAX,
@@ -114,11 +115,13 @@ class _UnixPtyProcessEntry:
     tty: bool
     primary_fd: int | None = None
     last_used: float = field(default_factory=time.monotonic)
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    termination_pending: bool = False
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
     output_closed: asyncio.Event = field(default_factory=asyncio.Event)
-    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pump_tasks: list[asyncio.Task[None]] = field(default_factory=list)
     wait_task: asyncio.Task[None] | None = None
 
@@ -131,6 +134,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
     state: UnixLocalSandboxSessionState
     _running: bool
+    _pty_launch_lock: asyncio.Lock
     _pty_lock: asyncio.Lock
     _pty_processes: dict[int, _UnixPtyProcessEntry]
     _reserved_pty_process_ids: set[int]
@@ -139,6 +143,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
     def __init__(self, *, state: UnixLocalSandboxSessionState) -> None:
         self.state = state
         self._running = False
+        self._pty_launch_lock = asyncio.Lock()
         self._pty_lock = asyncio.Lock()
         self._pty_processes = {}
         self._reserved_pty_process_ids = set()
@@ -341,16 +346,36 @@ class UnixLocalSandboxSession(BaseSandboxSession):
 
         entry.wait_task = asyncio.create_task(self._watch_process_exit(entry))
 
-        pruned_entry: _UnixPtyProcessEntry | None = None
-        async with self._pty_lock:
-            process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
-            self._reserved_pty_process_ids.add(process_id)
-            pruned_entry = self._prune_pty_processes_if_needed()
-            self._pty_processes[process_id] = entry
-            process_count = len(self._pty_processes)
+        process_id = 0
+        process_count = 0
+        try:
+            async with self._pty_launch_lock:
+                async with self._pty_lock:
+                    process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+                    self._reserved_pty_process_ids.add(process_id)
+                    pruned_entry = self._prune_pty_processes_if_needed()
+                    if len(self._pty_processes) >= PTY_PROCESSES_MAX and pruned_entry is None:
+                        self._reserved_pty_process_ids.discard(process_id)
+                        raise RuntimeError(
+                            "PTY process limit reached while all registered sessions "
+                            "are terminating"
+                        )
 
-        if pruned_entry is not None:
-            await self._terminate_pty_entry(pruned_entry)
+                if pruned_entry is not None:
+                    await self._retire_registered_pty_entry(
+                        process_id=pruned_entry[0],
+                        entry=pruned_entry[1],
+                    )
+
+                async with self._pty_lock:
+                    self._pty_processes[process_id] = entry
+                    process_count = len(self._pty_processes)
+        except BaseException:
+            if process_id:
+                async with self._pty_lock:
+                    self._reserved_pty_process_ids.discard(process_id)
+            await self._terminate_pty_entry(entry)
+            raise
 
         if process_count >= PTY_PROCESSES_WARNING:
             logger.warning(
@@ -359,17 +384,18 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-            max_output_tokens=max_output_tokens,
-        )
-        return await self._finalize_pty_update(
-            process_id=process_id,
-            entry=entry,
-            output=output,
-            original_token_count=original_token_count,
-        )
+        async with entry.output_poll_lock:
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                max_output_tokens=max_output_tokens,
+            )
+            return await self._finalize_pty_update(
+                process_id=process_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
 
     async def pty_write_stdin(
         self,
@@ -389,6 +415,8 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             async with self._pty_lock:
                 if self._pty_processes.get(session_id) is not entry:
                     raise PtySessionNotFoundError(session_id=session_id)
+                if entry.termination_pending:
+                    raise PtySessionNotFoundError(session_id=session_id)
 
             if chars:
                 if not entry.tty or entry.primary_fd is None:
@@ -405,6 +433,7 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                         raise
                 await asyncio.sleep(0.1)
 
+        async with entry.output_poll_lock:
             yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
             output, original_token_count = await self._collect_pty_output(
                 entry=entry,
@@ -428,27 +457,46 @@ class UnixLocalSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
+        retirement_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=session_id, entry=entry)
+        )
+        try:
+            return await asyncio.shield(retirement_task)
+        except asyncio.CancelledError:
+            try:
+                await await_task_ignoring_cancellation(retirement_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Unix-local targeted PTY cleanup failed after caller cancellation.",
+                    extra={"process_id": session_id},
+                    exc_info=cleanup_error,
+                )
+            raise
+
+    async def _retire_registered_pty_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _UnixPtyProcessEntry,
+    ) -> PtyExecUpdate:
         async with entry.operation_lock:
             async with self._pty_lock:
-                if self._pty_processes.get(session_id) is not entry:
-                    raise PtySessionNotFoundError(session_id=session_id)
+                if self._pty_processes.get(process_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=process_id)
+                entry.termination_pending = True
 
             await self._terminate_pty_entry(entry)
-            if entry.process.returncode is None:
-                await asyncio.wait_for(
-                    entry.process.wait(),
-                    timeout=_PTY_PROCESS_EXIT_GRACE_SECONDS,
+            async with entry.output_poll_lock:
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=0,
+                    max_output_tokens=None,
                 )
-            output, original_token_count = await self._collect_pty_output(
-                entry=entry,
-                yield_time_ms=0,
-                max_output_tokens=None,
-            )
-            async with self._pty_lock:
-                if self._pty_processes.get(session_id) is not entry:
-                    raise PtySessionNotFoundError(session_id=session_id)
-                self._pty_processes.pop(session_id)
-                self._reserved_pty_process_ids.discard(session_id)
+                async with self._pty_lock:
+                    if self._pty_processes.get(process_id) is not entry:
+                        raise PtySessionNotFoundError(session_id=process_id)
+                    self._pty_processes.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
 
         return PtyExecUpdate(
             process_id=None,
@@ -547,13 +595,28 @@ class UnixLocalSandboxSession(BaseSandboxSession):
         exit_code: int | None = entry.process.returncode
         live_process_id: int | None = process_id
 
-        if exit_code is not None:
+        if exit_code is not None and not entry.termination_pending:
             async with self._pty_lock:
-                removed = self._pty_processes.pop(process_id, None)
-                self._reserved_pty_process_ids.discard(process_id)
+                if self._pty_processes.get(process_id) is not entry:
+                    return PtyExecUpdate(
+                        process_id=None,
+                        output=output,
+                        exit_code=exit_code,
+                        original_token_count=original_token_count,
+                    )
+                entry.termination_pending = True
+                removed = self._pty_processes.get(process_id)
             if removed is not None:
                 await self._terminate_pty_entry(removed)
+            async with self._pty_lock:
+                if self._pty_processes.get(process_id) is entry:
+                    self._pty_processes.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
             live_process_id = None
+        else:
+            async with self._pty_lock:
+                if self._pty_processes.get(process_id) is not entry:
+                    live_process_id = None
 
         return PtyExecUpdate(
             process_id=live_process_id,
@@ -562,20 +625,24 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
-    def _prune_pty_processes_if_needed(self) -> _UnixPtyProcessEntry | None:
+    def _prune_pty_processes_if_needed(
+        self,
+    ) -> tuple[int, _UnixPtyProcessEntry] | None:
         if len(self._pty_processes) < PTY_PROCESSES_MAX:
             return None
 
-        meta = [
+        meta: list[tuple[int, float, bool]] = [
             (process_id, entry.last_used, entry.process.returncode is not None)
             for process_id, entry in self._pty_processes.items()
+            if not entry.termination_pending
         ]
         process_id = process_id_to_prune_from_meta(meta)
         if process_id is None:
             return None
 
-        self._reserved_pty_process_ids.discard(process_id)
-        return self._pty_processes.pop(process_id, None)
+        entry = self._pty_processes[process_id]
+        entry.termination_pending = True
+        return process_id, entry
 
     async def _terminate_pty_entry(self, entry: _UnixPtyProcessEntry) -> None:
         process = entry.process
@@ -586,25 +653,42 @@ class UnixLocalSandboxSession(BaseSandboxSession):
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
 
-        for task in entry.pump_tasks:
-            task.cancel()
-        if entry.wait_task is not None:
-            entry.wait_task.cancel()
-        if entry.tty:
-            if primary_fd is not None:
-                # On macOS we have observed os.close() on the PTY master fd block while a
-                # background reader thread is still inside os.read(). Keep the close task owned
-                # by the session without making PTY termination wait indefinitely for it.
-                self._schedule_fd_close(primary_fd)
-            entry.output_closed.set()
-            entry.output_notify.set()
-            return
+        wait_task = entry.wait_task
+        try:
+            if wait_task is not None:
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=_PTY_PROCESS_EXIT_GRACE_SECONDS,
+                )
+            elif process.returncode is None:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=_PTY_PROCESS_EXIT_GRACE_SECONDS,
+                )
+        except TimeoutError:
+            pass
+        finally:
+            if wait_task is None or not wait_task.done():
+                for task in entry.pump_tasks:
+                    task.cancel()
+                if wait_task is not None:
+                    wait_task.cancel()
+                await asyncio.gather(*entry.pump_tasks, return_exceptions=True)
+                if wait_task is not None:
+                    await asyncio.gather(wait_task, return_exceptions=True)
 
-        if primary_fd is not None:
-            _close_fd_quietly(primary_fd)
-        await asyncio.gather(*entry.pump_tasks, return_exceptions=True)
-        if entry.wait_task is not None:
-            await asyncio.gather(entry.wait_task, return_exceptions=True)
+            if primary_fd is not None:
+                if entry.tty:
+                    # On macOS we have observed os.close() on the PTY master fd block while a
+                    # background reader thread is still inside os.read(). Keep the close task
+                    # owned by the session without making PTY termination wait indefinitely.
+                    self._schedule_fd_close(primary_fd)
+                else:
+                    _close_fd_quietly(primary_fd)
+
+            if not entry.output_closed.is_set():
+                entry.output_closed.set()
+                entry.output_notify.set()
 
     def _schedule_fd_close(self, fd: int) -> None:
         task = asyncio.create_task(asyncio.to_thread(_close_fd_quietly, fd))
