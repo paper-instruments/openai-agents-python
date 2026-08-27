@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
+import shlex
+import subprocess
+import sys
 import tarfile
 import time
 import uuid
@@ -17,6 +21,7 @@ from pydantic import ValidationError
 from agents.sandbox import Manifest, SandboxPathGrant
 from agents.sandbox.config import DEFAULT_PYTHON_SANDBOX_IMAGE
 from agents.sandbox.errors import (
+    ExecNonZeroError,
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
@@ -26,8 +31,9 @@ from agents.sandbox.errors import (
     WorkspaceReadNotFoundError,
     WorkspaceWriteTypeError,
 )
+from agents.sandbox.files import EntryKind
 from agents.sandbox.snapshot import NoopSnapshot
-from agents.sandbox.types import ExposedPortEndpoint
+from agents.sandbox.types import ExecResult, ExposedPortEndpoint, User
 from agents.sandbox.util.tar_utils import validate_tar_bytes
 from tests._fake_workspace_paths import resolve_fake_workspace_path
 
@@ -45,6 +51,40 @@ def test_blaxel_package_re_exports_backend_symbols() -> None:
     assert package_module.BlaxelSandboxClient is BlaxelSandboxClient
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="the Blaxel supervisor runs on Linux")
+def test_blaxel_supervisor_retains_detached_descendant_ownership() -> None:
+    from agents.extensions.sandbox.blaxel import sandbox as mod
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            mod._BLAXEL_PROCESS_SUPERVISOR,
+            "sh",
+            "-c",
+            "setsid sleep 30 &",
+        ],
+        env={mod._BLAXEL_MANAGED_PROCESS_TOKEN_ENV: "test-token"},
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.2)
+        assert process.poll() is None
+    finally:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                mod._BLAXEL_PROCESS_GROUP_TERMINATOR,
+                "test-token",
+                "1",
+            ],
+            check=True,
+            timeout=5,
+        )
+        process.wait(timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # Fakes that replicate the Blaxel SDK surface used by the sandbox backend.
 # ---------------------------------------------------------------------------
@@ -58,12 +98,16 @@ class _FakeExecResult:
         output: str = "",
         stderr: str = "",
         pid: str = "",
+        name: str = "",
+        status: str = "completed",
     ) -> None:
         self.exit_code = exit_code
         self.stdout = output
         self.stderr = stderr
         self.logs = output
         self.pid = pid
+        self.name = name
+        self.status = status
 
 
 def _fake_helper_exec_result(command: str, *, symlinks: dict[str, str]) -> _FakeExecResult | None:
@@ -94,6 +138,11 @@ class _FakeProcess:
         self._results_queue: list[_FakeExecResult] = []
         self.delay: float = 0.0
         self.symlinks: dict[str, str] = {}
+        self.next_process_sequence: list[_FakeExecResult] = []
+        self.process_sequences: dict[str, list[_FakeExecResult]] = {}
+        self.get_calls: list[str] = []
+        self.kill_calls: list[str] = []
+        self.kill_error: Exception | None = None
 
     async def exec(self, config: dict[str, Any], **kwargs: object) -> _FakeExecResult:
         self.exec_calls.append((config, dict(kwargs)))
@@ -105,11 +154,35 @@ class _FakeProcess:
             return helper_result
         if self.delay > 0:
             await asyncio.sleep(self.delay)
+        name = config.get("name")
+        if name and config.get("wait_for_completion") is False:
+            sequence = self.next_process_sequence or [
+                _FakeExecResult(name=str(name), status="running", exit_code=0)
+            ]
+            self.next_process_sequence = []
+            self.process_sequences[str(name)] = sequence
+            return sequence[0]
         if self._results_queue:
             return self._results_queue.pop(0)
         result = self.next_result
         self.next_result = _FakeExecResult()
         return result
+
+    async def get(self, identifier: str) -> _FakeExecResult:
+        self.get_calls.append(identifier)
+        sequence = self.process_sequences[identifier]
+        if len(sequence) > 1:
+            return sequence.pop(0)
+        return sequence[0]
+
+    async def kill(self, identifier: str) -> None:
+        self.kill_calls.append(identifier)
+        if self.kill_error is not None:
+            raise self.kill_error
+        sequence = self.process_sequences.get(identifier)
+        if sequence is None:
+            raise FileNotFoundError(f"process not found: {identifier}")
+        sequence[:] = [_FakeExecResult(name=identifier, status="killed", exit_code=137)]
 
 
 class _FakeFs:
@@ -304,6 +377,236 @@ def _make_session(
     if state is None:
         state = _make_state()
     return BlaxelSandboxSession.from_state(state, sandbox=fake, token=token)
+
+
+class _LocalStatBlaxelSession:
+    @staticmethod
+    def create(
+        workspace: Path,
+        *,
+        extra_path_grants: tuple[SandboxPathGrant, ...] = (),
+    ) -> Any:
+        from agents.extensions.sandbox.blaxel.sandbox import BlaxelSandboxSession
+
+        class _Session(BlaxelSandboxSession):
+            def __init__(self) -> None:
+                super().__init__(
+                    state=_make_state(
+                        root=workspace.as_posix(),
+                        sandbox_url=None,
+                        extra_path_grants=extra_path_grants,
+                    ),
+                    sandbox=_FakeSandboxInstance(),
+                )
+                self.stat_exec_calls: list[tuple[str, ...]] = []
+
+            async def _exec_internal(
+                self,
+                *command: str | Path,
+                timeout: float | None = None,
+            ) -> ExecResult:
+                rendered = tuple(str(part) for part in command)
+                self.stat_exec_calls.append(rendered)
+                process = await asyncio.create_subprocess_exec(
+                    *rendered,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+                return ExecResult(stdout=stdout, stderr=stderr, exit_code=process.returncode or 0)
+
+        return _Session()
+
+
+def _stat_entry_stdout(*, mode: int = 0o100640, size: int = 4) -> str:
+    return json.dumps(
+        {
+            "group": "runner",
+            "mode": mode,
+            "owner": "runner",
+            "size": size,
+            "status": "entry",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_blaxel_exec_sends_timeout_in_seconds(
+    fake_sandbox: _FakeSandboxInstance,
+) -> None:
+    session = _make_session(fake_sandbox)
+
+    await session._exec_internal("true", timeout=1.2)
+
+    config, _kwargs = fake_sandbox.process.exec_calls[-1]
+    assert config["timeout"] == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Blaxel worker runs on Linux")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_kind", "expected_size"),
+    [
+        (EntryKind.FILE, 5),
+        (EntryKind.DIRECTORY, None),
+        (EntryKind.OTHER, None),
+    ],
+)
+async def test_blaxel_stat_returns_metadata_with_one_routed_exec(
+    tmp_path: Path,
+    entry_kind: EntryKind,
+    expected_size: int | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "target"
+    if entry_kind is EntryKind.FILE:
+        target.write_bytes(b"hello")
+    elif entry_kind is EntryKind.DIRECTORY:
+        target.mkdir()
+    else:
+        os.mkfifo(target)
+    session = _LocalStatBlaxelSession.create(workspace)
+
+    result = await session.stat("target")
+
+    assert result is not None
+    assert result.path == target.as_posix()
+    assert result.kind is entry_kind
+    assert result.permissions.directory is (entry_kind is EntryKind.DIRECTORY)
+    if expected_size is not None:
+        assert result.size == expected_size
+    assert len(session.stat_exec_calls) == 1
+    assert session.stat_exec_calls[0][:2] == ("python3", "-c")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Blaxel worker runs on Linux")
+@pytest.mark.asyncio
+async def test_blaxel_stat_returns_none_only_for_missing_final_target(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session = _LocalStatBlaxelSession.create(workspace)
+
+    assert await session.stat("missing.txt") is None
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Blaxel worker runs on Linux")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_kind", "reason"),
+    [
+        ("missing", "missing_ancestor"),
+        ("dangling_symlink", "missing_ancestor"),
+        ("file", "not_directory"),
+    ],
+)
+async def test_blaxel_stat_distinguishes_invalid_ancestors(
+    tmp_path: Path,
+    parent_kind: str,
+    reason: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if parent_kind == "file":
+        (workspace / "parent").write_text("not a directory", encoding="utf-8")
+    elif parent_kind == "dangling_symlink":
+        (workspace / "parent").symlink_to("missing", target_is_directory=True)
+    session = _LocalStatBlaxelSession.create(workspace)
+
+    with pytest.raises(WorkspaceReadNotFoundError) as exc_info:
+        await session.stat("parent/target.txt")
+
+    assert exc_info.value.context["reason"] == reason
+    assert exc_info.value.context["component"] == (workspace / "parent").as_posix()
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Blaxel worker runs on Linux")
+@pytest.mark.asyncio
+async def test_blaxel_stat_follows_safe_symlink_and_rejects_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real_parent = workspace / "real"
+    real_parent.mkdir()
+    (real_parent / "target.txt").write_text("content", encoding="utf-8")
+    (workspace / "parent").symlink_to(real_parent, target_is_directory=True)
+    session = _LocalStatBlaxelSession.create(workspace)
+
+    result = await session.stat("parent/target.txt")
+
+    assert result is not None
+    assert result.kind is EntryKind.FILE
+    assert result.size == len("content")
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (workspace / "escape.txt").symlink_to(outside)
+    with pytest.raises(InvalidManifestPathError) as exc_info:
+        await session.stat("escape.txt")
+    assert exc_info.value.context["resolved_path"] == outside.as_posix()
+    assert len(session.stat_exec_calls) == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Blaxel worker runs on Linux")
+@pytest.mark.asyncio
+async def test_blaxel_stat_honors_extra_path_grants(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    grant = tmp_path / "grant"
+    grant.mkdir()
+    granted_file = grant / "allowed.txt"
+    granted_file.write_text("allowed", encoding="utf-8")
+    session = _LocalStatBlaxelSession.create(
+        workspace,
+        extra_path_grants=(SandboxPathGrant(path=grant.as_posix()),),
+    )
+
+    result = await session.stat(granted_file)
+
+    assert result is not None
+    assert result.path == granted_file.as_posix()
+    assert result.kind is EntryKind.FILE
+    assert len(session.stat_exec_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_blaxel_stat_passes_optional_user_through_provider_exec(
+    fake_sandbox: _FakeSandboxInstance,
+) -> None:
+    session = _make_session(fake_sandbox)
+    fake_sandbox.process.next_result = _FakeExecResult(output=_stat_entry_stdout(mode=0o140770))
+
+    result = await session.stat("report.txt", user=User(name="runner"))
+
+    assert result is not None
+    assert result.kind is EntryKind.OTHER
+    config, _kwargs = fake_sandbox.process.exec_calls[-1]
+    assert shlex.split(str(config["command"]))[:4] == ["sudo", "-u", "runner", "--"]
+
+
+@pytest.mark.asyncio
+async def test_blaxel_stat_propagates_operational_failure(
+    fake_sandbox: _FakeSandboxInstance,
+) -> None:
+    session = _make_session(fake_sandbox)
+    fake_sandbox.process.next_result = _FakeExecResult(exit_code=13, stderr="permission denied")
+
+    with pytest.raises(ExecNonZeroError, match="permission denied"):
+        await session.stat("report.txt")
+
+
+@pytest.mark.asyncio
+async def test_blaxel_stat_rejects_malformed_provider_output(
+    fake_sandbox: _FakeSandboxInstance,
+) -> None:
+    session = _make_session(fake_sandbox)
+    fake_sandbox.process.next_result = _FakeExecResult(output="not-json")
+
+    with pytest.raises(ExecTransportError) as exc_info:
+        await session.stat("report.txt")
+
+    assert exc_info.value.context["reason"] == "malformed_stat_response"
 
 
 # ---------------------------------------------------------------------------
@@ -1581,6 +1884,13 @@ class _FakeWS:
 
     async def send_str(self, data: str) -> None:
         self._sent.append(data)
+        payload = json.loads(data)
+        command = str(payload.get("data", ""))
+        marker_prefix = "OPENAI_AGENTS_EXIT:"
+        if marker_prefix in command:
+            token = command.split(marker_prefix, 1)[1].split(":", 1)[0]
+            completion = json.dumps({"type": "output", "data": f"\x1e{marker_prefix}{token}:0\x1f"})
+            self._messages.append(_FakeWSMessage(_FakeAiohttp.WSMsgType.TEXT, completion))
 
     async def close(self) -> None:
         self._closed = True
@@ -1633,6 +1943,197 @@ class _FakeAiohttp:
 
 
 class TestPtyExec:
+    def test_managed_process_scripts_are_valid_python_without_nul_bytes(self) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        for script in (mod._BLAXEL_PROCESS_SUPERVISOR, mod._BLAXEL_PROCESS_GROUP_TERMINATOR):
+            assert "\0" not in script
+            compile(script, "<blaxel-managed-process>", "exec")
+
+    def test_tty_completion_token_is_not_exposed_to_child(self) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        command, marker = mod._blaxel_tty_command(
+            ["sh", "-c", "env"],
+            "owned-process",
+            "private-completion",
+        )
+
+        assert f"{mod._BLAXEL_MANAGED_PROCESS_TOKEN_ENV}=owned-process" in command
+        assert b"private-completion" in marker
+        assert b"owned-process" not in marker
+
+    @pytest.mark.asyncio
+    async def test_non_tty_uses_named_process_and_returns_clean_exit(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running", output="hello"),
+            _FakeExecResult(status="completed", output="hello world\n", exit_code=0),
+        ]
+        session = _make_session(fake_sandbox)
+
+        update = await session.pty_exec_start("echo", "hello world", yield_time_s=1)
+
+        assert update.process_id is None
+        assert update.output == b"hello world\n"
+        assert update.exit_code == 0
+        launch, _kwargs = fake_sandbox.process.exec_calls[0]
+        assert launch["wait_for_completion"] is False
+        assert str(launch["name"]).startswith("openai-agents-pty-")
+        assert "setsid" in str(launch["command"])
+        assert mod._BLAXEL_MANAGED_PROCESS_TOKEN_ENV in launch["env"]
+
+    @pytest.mark.asyncio
+    async def test_non_tty_incremental_logs_are_not_duplicated(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running", output="one\n"),
+            _FakeExecResult(status="running", output="one\ntwo\n"),
+            _FakeExecResult(status="failed", output="one\ntwo\n", exit_code=7),
+        ]
+        session = _make_session(fake_sandbox)
+
+        update = await session.pty_exec_start("false", yield_time_s=1)
+
+        assert update.output == b"one\ntwo\n"
+        assert update.exit_code == 7
+
+    @pytest.mark.asyncio
+    async def test_non_tty_rejects_stdin_and_targeted_stop_leaves_sibling(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        session = _make_session(fake_sandbox)
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running", output="first\n")
+        ]
+        first = await session.pty_exec_start("sleep", "30", yield_time_s=0)
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running", output="second\n")
+        ]
+        second = await session.pty_exec_start("sleep", "30", yield_time_s=0)
+        assert first.process_id is not None
+        assert second.process_id is not None
+
+        with pytest.raises(RuntimeError, match="stdin is not available"):
+            await session.pty_write_stdin(
+                session_id=first.process_id,
+                chars="input",
+                yield_time_s=0,
+            )
+
+        stopped = await session.pty_terminate(first.process_id)
+
+        assert stopped.process_id is None
+        assert stopped.exit_code == 137
+        assert second.process_id in session._pty_sessions
+        assert len(fake_sandbox.process.kill_calls) == 1
+        await session.pty_terminate(second.process_id)
+
+    @pytest.mark.asyncio
+    async def test_targeted_stop_interrupts_blocked_output_poll(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
+        session = _make_session(fake_sandbox)
+        started = await session.pty_exec_start("sleep", "30", yield_time_s=0)
+        assert started.process_id is not None
+        poll = asyncio.create_task(
+            session.pty_write_stdin(
+                session_id=started.process_id,
+                chars="",
+                yield_time_s=30,
+            )
+        )
+        await asyncio.sleep(0)
+
+        await session.pty_terminate(started.process_id)
+        update = await asyncio.wait_for(poll, timeout=1)
+
+        assert update.process_id == started.process_id
+
+    @pytest.mark.asyncio
+    async def test_failed_targeted_cleanup_remains_retryable(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
+        fake_sandbox.process.kill_error = RuntimeError("kill failed")
+        session = _make_session(fake_sandbox)
+        started = await session.pty_exec_start("sleep", "30", yield_time_s=0)
+        assert started.process_id is not None
+
+        with pytest.raises(RuntimeError, match="kill failed"):
+            await session.pty_terminate(started.process_id)
+
+        assert started.process_id in session._pty_sessions
+        assert session._pty_sessions[started.process_id].termination_pending
+        fake_sandbox.process.kill_error = None
+        update = await session.pty_terminate(started.process_id)
+        assert update.process_id is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_launch_finishes_cleanup(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.delay = 0.05
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
+        session = _make_session(fake_sandbox)
+        launch = asyncio.create_task(session.pty_exec_start("sleep", "30", yield_time_s=0))
+        await asyncio.sleep(0.01)
+        launch.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+
+        assert session._pty_sessions == {}
+        assert len(fake_sandbox.process.kill_calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("global_cleanup", [False, True])
+    async def test_cancelled_cleanup_finishes_owned_retirement(
+        self,
+        fake_sandbox: _FakeSandboxInstance,
+        global_cleanup: bool,
+    ) -> None:
+        fake_sandbox.process.next_process_sequence = [_FakeExecResult(status="running")]
+        session = _make_session(fake_sandbox)
+        started = await session.pty_exec_start("sleep", "30", yield_time_s=0)
+        assert started.process_id is not None
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_cleanup = session._terminate_blaxel_process_group
+
+        async def _blocked_cleanup(
+            process_token: str,
+            *,
+            reconcile_late_start: bool,
+        ) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await original_cleanup(
+                process_token,
+                reconcile_late_start=reconcile_late_start,
+            )
+
+        session._terminate_blaxel_process_group = _blocked_cleanup
+        cleanup = asyncio.create_task(
+            session.pty_terminate_all()
+            if global_cleanup
+            else session.pty_terminate(started.process_id)
+        )
+        await cleanup_started.wait()
+        cleanup.cancel()
+        release_cleanup.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+
+        assert session._pty_sessions == {}
+        assert len(fake_sandbox.process.kill_calls) == 1
+
     @pytest.mark.asyncio
     async def test_pty_exec_start_success(self, fake_sandbox: _FakeSandboxInstance) -> None:
         from agents.extensions.sandbox.blaxel import sandbox as mod
@@ -1644,10 +2145,11 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "hello", yield_time_s=0.5)
-            assert update.output is not None
-            assert b"hello from pty" in update.output
-            # process_id may be None if the reader finishes before finalize (entry.done=True).
+            update = await session.pty_exec_start("echo", "hello", tty=True, yield_time_s=0.5)
+            assert update.process_id is None
+            assert update.exit_code == 0
+            assert update.output == b"hello from pty"
+            assert b"OPENAI_AGENTS_EXIT" not in update.output
 
     @pytest.mark.asyncio
     async def test_pty_exec_start_timeout(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -1670,7 +2172,7 @@ class TestPtyExec:
 
         with patch.object(mod, "_import_aiohttp", return_value=_SlowAiohttp()):
             with pytest.raises(ExecTimeoutError):
-                await session.pty_exec_start("echo", "hello", timeout=0.01)
+                await session.pty_exec_start("echo", "hello", timeout=0.01, tty=True)
 
     @pytest.mark.asyncio
     async def test_pty_exec_start_timeout_reports_default_timeout(
@@ -1698,7 +2200,7 @@ class TestPtyExec:
 
         with patch.object(mod, "_import_aiohttp", return_value=_SlowAiohttp()):
             with pytest.raises(ExecTimeoutError) as exc_info:
-                await session.pty_exec_start("echo", "hello")
+                await session.pty_exec_start("echo", "hello", tty=True)
 
         assert exc_info.value.timeout_s == 1.0
 
@@ -1725,7 +2227,7 @@ class TestPtyExec:
 
         with patch.object(mod, "_import_aiohttp", return_value=_ErrorAiohttp()):
             with pytest.raises(ExecTransportError):
-                await session.pty_exec_start("echo", "hello")
+                await session.pty_exec_start("echo", "hello", tty=True)
 
     @pytest.mark.asyncio
     async def test_pty_write_stdin(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -1797,7 +2299,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("bad_cmd", yield_time_s=0.5)
+            update = await session.pty_exec_start("bad_cmd", tty=True, yield_time_s=0.5)
             assert update.output is not None
             assert b"something failed" in update.output
 
@@ -1811,7 +2313,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.5)
             assert b"binary-data" in update.output
 
     @pytest.mark.asyncio
@@ -1830,7 +2332,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.5)
             assert b"hi" in update.output
 
     @pytest.mark.asyncio
@@ -1850,7 +2352,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.5)
             # Invalid JSON should be silently ignored; valid output should appear.
             assert b"valid" in update.output
 
@@ -1869,7 +2371,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.3)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.3)
             # Error WS message should break the reader loop.
             assert update.output is not None
 
@@ -1882,7 +2384,6 @@ class TestPtyExec:
             ws_session_id="test-done",
             ws=None,
             http_session=None,
-            done=True,
             exit_code=0,
         )
         # Manually register the entry.
@@ -1911,7 +2412,6 @@ class TestPtyExec:
                 ws_session_id=f"test-{i}",
                 ws=None,
                 http_session=None,
-                done=True,
                 exit_code=0,
             )
             entry.last_used = time.monotonic() - (PTY_PROCESSES_MAX - i)
@@ -1946,7 +2446,7 @@ class TestPtyExec:
             ws_session_id="term-test",
             ws=ws,
             http_session=http,
-            reader_task=task,
+            wait_task=task,
         )
         await session._terminate_pty_entry(entry)
         assert task.cancelled() or task.done()
@@ -1962,7 +2462,7 @@ class TestPtyExec:
             ws_session_id="null-test",
             ws=None,
             http_session=None,
-            reader_task=None,
+            wait_task=None,
         )
         # Should not raise.
         await session._terminate_pty_entry(entry)
@@ -1985,7 +2485,7 @@ class TestPtyExec:
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
             # Pass yield_time_s=None to test default (10s), but with a short timeout.
             # We use a small timeout to not wait 10 seconds.
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.1)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.1)
             assert b"quick" in update.output
 
     @pytest.mark.asyncio
@@ -2001,7 +2501,7 @@ class TestPtyExec:
         session = _make_session(fake_sandbox)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.5)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.5)
             assert b"cap-data" in update.output
 
     @pytest.mark.asyncio
@@ -2016,7 +2516,7 @@ class TestPtyExec:
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
             update = await session.pty_exec_start(
-                "echo", "test", yield_time_s=0.5, max_output_tokens=10
+                "echo", "test", tty=True, yield_time_s=0.5, max_output_tokens=10
             )
             # Output should be truncated.
             assert len(update.output) < len(long_output.encode())
@@ -2221,7 +2721,7 @@ class TestTerminatePtyEntryErrors:
             ws_session_id="err-close",
             ws=_ErrorWS(),
             http_session=_ErrorHTTP(),
-            reader_task=None,
+            wait_task=None,
         )
         # Should not raise.
         await session._terminate_pty_entry(entry)
@@ -2242,7 +2742,7 @@ class TestTerminatePtyEntryErrors:
             ws_session_id="done-reader",
             ws=_FakeWS(),
             http_session=_FakeHTTPSession(),
-            reader_task=task,
+            wait_task=task,
         )
         await session._terminate_pty_entry(entry)
 
@@ -2264,7 +2764,7 @@ class TestCollectPtyOutputEdgeCases:
             ws_session_id="done-imm",
             ws=None,
             http_session=None,
-            done=True,
+            exit_code=0,
         )
         entry.output_chunks.append(b"final output")
         output, token_count = await session._collect_pty_output(
@@ -2518,7 +3018,6 @@ class TestFinalCoverageGaps:
                 ws_session_id=f"fill-{i}",
                 ws=None,
                 http_session=None,
-                done=True,
                 exit_code=0,
             )
             entry.last_used = time.monotonic() - (PTY_PROCESSES_MAX - i)
@@ -2536,7 +3035,7 @@ class TestFinalCoverageGaps:
         fake_aiohttp = _FakeAiohttp(ws=ws)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.3)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.3)
             assert b"pruned-test" in update.output
 
     @pytest.mark.asyncio
@@ -2569,7 +3068,7 @@ class TestFinalCoverageGaps:
         fake_aiohttp = _FakeAiohttp(ws=ws)
 
         with patch.object(mod, "_import_aiohttp", return_value=fake_aiohttp):
-            update = await session.pty_exec_start("echo", "test", yield_time_s=0.3)
+            update = await session.pty_exec_start("echo", "test", tty=True, yield_time_s=0.3)
             assert update.output is not None
 
     @pytest.mark.asyncio
@@ -2605,32 +3104,7 @@ class TestFinalCoverageGaps:
 
         # Run the reader directly.
         await session._pty_ws_reader(entry)
-        assert entry.done is True
-
-    @pytest.mark.asyncio
-    async def test_terminate_pty_outer_exception(self, fake_sandbox: _FakeSandboxInstance) -> None:
-        """Cover lines 841-842: outer except Exception: pass in _terminate_pty_entry."""
-        from agents.extensions.sandbox.blaxel.sandbox import _BlaxelPtySessionEntry
-
-        session = _make_session(fake_sandbox)
-
-        class _BadReaderTask:
-            """Fake task whose done() raises."""
-
-            def done(self) -> bool:
-                raise RuntimeError("task check failed")
-
-            def cancel(self) -> None:
-                pass
-
-        entry = _BlaxelPtySessionEntry(
-            ws_session_id="outer-err",
-            ws=None,
-            http_session=None,
-            reader_task=_BadReaderTask(),  # type: ignore[arg-type]
-        )
-        # Should not raise.
-        await session._terminate_pty_entry(entry)
+        assert entry.exit_code == 1
 
     @pytest.mark.asyncio
     async def test_prune_returns_none_when_no_pid(self, fake_sandbox: _FakeSandboxInstance) -> None:
@@ -2688,7 +3162,7 @@ class TestFinalCoverageGaps:
             ws_session_id="done-chunks",
             ws=None,
             http_session=None,
-            done=True,
+            exit_code=0,
         )
         # Add chunks after marking done, to test the inner drain loop.
         entry.output_chunks.append(b"chunk1")
