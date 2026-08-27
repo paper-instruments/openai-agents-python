@@ -1950,6 +1950,15 @@ class TestPtyExec:
             assert "\0" not in script
             compile(script, "<blaxel-managed-process>", "exec")
 
+    def test_non_tty_supervisor_starts_and_waits_for_its_own_session(self) -> None:
+        from agents.extensions.sandbox.blaxel import sandbox as mod
+
+        command = shlex.split(mod._blaxel_supervised_command(["false"]))
+
+        assert command[:2] == ["exec", "python3"]
+        assert "setsid" not in command
+        assert "start_new_session=True" in mod._BLAXEL_PROCESS_SUPERVISOR
+
     def test_tty_completion_token_is_not_exposed_to_child(self) -> None:
         from agents.extensions.sandbox.blaxel import sandbox as mod
 
@@ -1983,7 +1992,7 @@ class TestPtyExec:
         launch, _kwargs = fake_sandbox.process.exec_calls[0]
         assert launch["wait_for_completion"] is False
         assert str(launch["name"]).startswith("openai-agents-pty-")
-        assert "setsid" in str(launch["command"])
+        assert "setsid" not in str(launch["command"])
         assert mod._BLAXEL_MANAGED_PROCESS_TOKEN_ENV in launch["env"]
 
     @pytest.mark.asyncio

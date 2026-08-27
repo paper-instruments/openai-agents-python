@@ -129,7 +129,7 @@ def owned_process_exists():
 
 
 signal.signal(signal.SIGTERM, keep_supervisor_alive)
-process = subprocess.Popen(sys.argv[1:])
+process = subprocess.Popen(sys.argv[1:], start_new_session=True)
 status = process.wait()
 while owned_process_exists():
     time.sleep(0.05)
@@ -206,8 +206,7 @@ def _blaxel_process_group_termination_command(
 
 def _blaxel_supervised_command(command: Sequence[str | Path]) -> str:
     return shlex.join(
-        ("exec", "setsid", "--", "python3", "-c", _BLAXEL_PROCESS_SUPERVISOR)
-        + tuple(str(part) for part in command)
+        ("exec", "python3", "-c", _BLAXEL_PROCESS_SUPERVISOR) + tuple(str(part) for part in command)
     )
 
 
