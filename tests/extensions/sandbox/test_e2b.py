@@ -3122,13 +3122,15 @@ async def test_e2b_concurrent_starts_do_not_exceed_process_capacity() -> None:
     prune_started = asyncio.Event()
     prune_release = asyncio.Event()
     entries = {}
-    for process_id in range(1_000, 1_064):
+    process_ids = range(1_000, 1_064)
+    oldest_last_used = time.monotonic() - len(process_ids)
+    for offset, process_id in enumerate(process_ids):
         handle = _FakeE2BPtyHandle(wait_never=True)
         entry = e2b_module._E2BPtyProcessEntry(  # noqa: SLF001
             handle=handle,
             tty=True,
         )
-        entry.last_used = float(process_id)
+        entry.last_used = oldest_last_used + offset
         entries[process_id] = entry
         if process_id == 1_000:
 
