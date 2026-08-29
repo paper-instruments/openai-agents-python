@@ -99,7 +99,7 @@ class File(BaseEntry):
         dest: Path,
         base_dir: Path,
     ) -> list[MaterializedFile]:
-        await session.write(dest, io.BytesIO(self.content))
+        await session._stage_file_write(dest, self.content)
         await self._apply_metadata(session, dest)
         return []
 

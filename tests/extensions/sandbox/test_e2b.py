@@ -15,6 +15,7 @@ import sys
 import tarfile
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, cast
 
@@ -40,6 +41,7 @@ from agents.extensions.sandbox.e2b.sandbox import (
 from agents.sandbox import Manifest
 from agents.sandbox.entries import (
     Dir,
+    File,
     InContainerMountStrategy,
     Mount,
     MountpointMountPattern,
@@ -68,6 +70,7 @@ from agents.sandbox.session.runtime_helpers import (
     RESOLVE_WORKSPACE_PATH_HELPER,
     WORKSPACE_FINGERPRINT_HELPER,
 )
+from agents.sandbox.session.sandbox_session import SandboxSession
 from agents.sandbox.snapshot import NoopSnapshot, SnapshotBase
 from agents.sandbox.types import ExecResult, User
 from agents.sandbox.workspace_paths import SandboxPathGrant
@@ -425,6 +428,8 @@ class _FakeE2BFiles:
     def __init__(self) -> None:
         self.make_dir_calls: list[tuple[str, float | None]] = []
         self.make_dir_error: BaseException | None = None
+        self.write_calls: list[tuple[str, bytes, float | None]] = []
+        self.write_files_calls: list[tuple[list[dict[str, object]], float | None]] = []
 
     async def write(
         self,
@@ -432,7 +437,14 @@ class _FakeE2BFiles:
         data: bytes,
         request_timeout: float | None = None,
     ) -> None:
-        _ = (path, data, request_timeout)
+        self.write_calls.append((path, data, request_timeout))
+
+    async def write_files(
+        self,
+        files: Sequence[dict[str, object]],
+        request_timeout: float | None = None,
+    ) -> None:
+        self.write_files_calls.append((list(files), request_timeout))
 
     async def remove(self, path: str, request_timeout: float | None = None) -> None:
         _ = (path, request_timeout)
@@ -1308,6 +1320,111 @@ def _tar_bytes() -> bytes:
         info.size = len(payload)
         tar.addfile(info, io.BytesIO(payload))
     return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_e2b_manifest_uses_native_bulk_write_for_files() -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+    sandbox.commands.exec_root_ready = True
+    session.state.manifest = Manifest(
+        root="/workspace",
+        entries={
+            "skills/alpha.md": File(content=b"alpha"),
+            "skills/beta.md": File(content=b"beta"),
+        },
+    )
+
+    result = await session.apply_manifest()
+
+    assert result.files == []
+    assert sandbox.files.write_calls == []
+    assert sandbox.files.write_files_calls == [
+        (
+            [
+                {"path": "/workspace/skills/alpha.md", "data": b"alpha"},
+                {"path": "/workspace/skills/beta.md", "data": b"beta"},
+            ],
+            session.state.timeouts.file_upload_s,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_e2b_manifest_bulk_write_skips_remote_path_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, sandbox = _session(workspace_root_ready=True)
+
+    async def fail_validation(*_args: object, **_kwargs: object) -> Path:
+        raise AssertionError("manifest bulk writes must not perform remote path validation")
+
+    monkeypatch.setattr(session, "_validate_path_access", fail_validation)
+
+    await session._write_file_batch(
+        [
+            (Path("/workspace/.agents/alpha/SKILL.md"), b"alpha"),
+            (Path("/workspace/.agents/beta/SKILL.md"), b"beta"),
+        ]
+    )
+
+    assert sandbox.files.write_files_calls == [
+        (
+            [
+                {"path": "/workspace/.agents/alpha/SKILL.md", "data": b"alpha"},
+                {"path": "/workspace/.agents/beta/SKILL.md", "data": b"beta"},
+            ],
+            session.state.timeouts.file_upload_s,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_e2b_wrapped_live_manifest_uses_one_bulk_write_across_nested_directories() -> None:
+    inner, sandbox = _session(workspace_root_ready=True)
+    session = SandboxSession(inner)
+    sandbox.commands.exec_root_ready = True
+    entries = [
+        (
+            Path("/workspace/.agents/alpha"),
+            Dir(
+                children={
+                    "SKILL.md": File(content=b"alpha"),
+                    "references": Dir(
+                        children={
+                            "one.md": File(content=b"one"),
+                            "two.md": File(content=b"two"),
+                        }
+                    ),
+                }
+            ),
+        ),
+        (
+            Path("/workspace/.agents/beta"),
+            Dir(
+                children={"SKILL.md": File(content=b"beta")},
+            ),
+        ),
+    ]
+
+    result = await session._apply_entry_batch(entries, base_dir=Path("/"))
+
+    assert result == []
+    assert sandbox.files.write_calls == []
+    assert len(sandbox.files.write_files_calls) == 1
+    uploaded_files, request_timeout = sandbox.files.write_files_calls[0]
+    assert request_timeout == inner.state.timeouts.file_upload_s
+    assert {str(file["path"]): file["data"] for file in uploaded_files} == {
+        "/workspace/.agents/alpha/SKILL.md": b"alpha",
+        "/workspace/.agents/alpha/references/one.md": b"one",
+        "/workspace/.agents/alpha/references/two.md": b"two",
+        "/workspace/.agents/beta/SKILL.md": b"beta",
+    }
+    chmod_commands = [
+        call["command"]
+        for call in sandbox.commands.calls
+        if str(call["command"]).startswith("chmod ")
+    ]
+    assert chmod_commands == ["chmod -R 0755 /workspace/.agents"]
 
 
 @pytest.mark.asyncio

@@ -437,6 +437,13 @@ class _E2BFilesAPI:
     ) -> object:
         raise NotImplementedError
 
+    async def write_files(
+        self,
+        files: Sequence[dict[str, object]],
+        request_timeout: float | None = None,
+    ) -> object:
+        raise NotImplementedError
+
     async def remove(self, path: str, request_timeout: float | None = None) -> object:
         raise NotImplementedError
 
@@ -617,6 +624,18 @@ async def _sandbox_write_file(
     return await _as_sandbox_api(sandbox).files.write(
         path,
         data,
+        request_timeout=request_timeout,
+    )
+
+
+async def _sandbox_write_files(
+    sandbox: object,
+    files: Sequence[dict[str, object]],
+    *,
+    request_timeout: float | None = None,
+) -> object:
+    return await _as_sandbox_api(sandbox).files.write_files(
+        files,
         request_timeout=request_timeout,
     )
 
@@ -1828,6 +1847,31 @@ class E2BSandboxSession(BaseSandboxSession):
             )
         except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
             raise WorkspaceArchiveWriteError(path=workspace_path, cause=e) from e
+
+    async def _write_file_batch(
+        self,
+        files: Sequence[tuple[Path, bytes]],
+    ) -> None:
+        """Write manifest-resolved paths in one E2B request without revalidating remotely."""
+        payload: list[dict[str, object]] = [
+            {"path": sandbox_path_str(path), "data": content} for path, content in files
+        ]
+
+        try:
+            await _sandbox_write_files(
+                self._sandbox,
+                payload,
+                request_timeout=self.state.timeouts.file_upload_s,
+            )
+        except Exception as e:  # pragma: no cover - exercised via unit tests with fakes
+            raise WorkspaceArchiveWriteError(
+                path=files[0][0],
+                context={
+                    "file_count": len(files),
+                    "paths": [sandbox_path_str(path) for path, _ in files],
+                },
+                cause=e,
+            ) from e
 
     async def running(self) -> bool:
         if not self._workspace_root_ready:

@@ -155,10 +155,10 @@ class ManifestApplier:
 
                 return _apply
 
-            batch = list(parallel_batch)
+            tasks = [_make_apply_task(dest, artifact) for dest, artifact in parallel_batch]
             parallel_batch.clear()
             batch_files = await gather_in_order(
-                [_make_apply_task(dest, artifact) for dest, artifact in batch],
+                tasks,
                 max_concurrency=self._max_entry_concurrency,
             )
             for entry_files in batch_files:
