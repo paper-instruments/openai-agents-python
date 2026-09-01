@@ -141,6 +141,7 @@ class _FakeProcess:
         self.next_process_sequence: list[_FakeExecResult] = []
         self.process_sequences: dict[str, list[_FakeExecResult]] = {}
         self.get_calls: list[str] = []
+        self.get_errors: list[Exception] = []
         self.kill_calls: list[str] = []
         self.kill_error: Exception | None = None
 
@@ -176,6 +177,8 @@ class _FakeProcess:
 
     async def get(self, identifier: str) -> _FakeExecResult:
         self.get_calls.append(identifier)
+        if self.get_errors:
+            raise self.get_errors.pop(0)
         sequence = self.process_sequences[identifier]
         if len(sequence) > 1:
             return sequence.pop(0)
@@ -2050,6 +2053,24 @@ class TestPtyExec:
 
         assert update.output == b"one\ntwo\n"
         assert update.exit_code == 7
+
+    @pytest.mark.asyncio
+    async def test_non_tty_transient_poll_failure_preserves_running_process(
+        self, fake_sandbox: _FakeSandboxInstance
+    ) -> None:
+        fake_sandbox.process.get_errors = [ConnectionError("temporary lookup failure")]
+        fake_sandbox.process.next_process_sequence = [
+            _FakeExecResult(status="running", output="started\n"),
+            _FakeExecResult(status="completed", output="started\ndone\n", exit_code=0),
+        ]
+        session = _make_session(fake_sandbox)
+
+        update = await session.pty_exec_start("slow-command", yield_time_s=1)
+
+        assert update.process_id is None
+        assert update.output == b"started\ndone\n"
+        assert update.exit_code == 0
+        assert len(fake_sandbox.process.get_calls) == 3
 
     @pytest.mark.asyncio
     async def test_non_tty_rejects_stdin_and_targeted_stop_leaves_sibling(

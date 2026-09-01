@@ -131,6 +131,7 @@ def owned_process_exists():
 signal.signal(signal.SIGTERM, keep_supervisor_alive)
 process = subprocess.Popen(sys.argv[1:], start_new_session=True)
 status = process.wait()
+time.sleep({_BLAXEL_PROCESS_GROUP_TERM_POLL_S})
 while owned_process_exists():
     time.sleep(0.05)
 raise SystemExit(128 - status if status < 0 else status)
@@ -1563,7 +1564,16 @@ class BlaxelSandboxSession(BaseSandboxSession):
         assert entry.process_name is not None
         try:
             while True:
-                process = await self._sandbox.process.get(entry.process_name)
+                try:
+                    process = await self._sandbox.process.get(entry.process_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if entry.termination_pending:
+                        return
+                    logger.debug("Blaxel process poll failed; retrying: %s", error)
+                    await asyncio.sleep(_BLAXEL_PROCESS_STATUS_POLL_S)
+                    continue
                 logs = str(getattr(process, "logs", "") or "")
                 encoded_logs = logs.encode("utf-8", errors="replace")
                 if len(encoded_logs) > entry.consumed_log_bytes:
