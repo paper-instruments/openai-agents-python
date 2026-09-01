@@ -21,6 +21,7 @@ import shlex
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,20 +32,24 @@ from pydantic import BaseModel, Field
 
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
+    ExecNonZeroError,
     ExecTimeoutError,
     ExecTransportError,
     ExposedPortUnavailableError,
+    InvalidManifestPathError,
+    PtySessionNotFoundError,
     WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
     WorkspaceReadNotFoundError,
     WorkspaceWriteTypeError,
 )
+from ....sandbox.files import EntryKind, FileEntry
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
-from ....sandbox.session.pty_output import collect_pty_output
+from ....sandbox.session.pty_lifecycle import await_task_ignoring_cancellation
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -53,12 +58,14 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
+    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient
+from ....sandbox.session.stat_script import STAT_SCRIPT
 from ....sandbox.session.tar_workspace import shell_tar_exclude_args
 from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
-from ....sandbox.types import ExecResult, ExposedPortEndpoint, User
+from ....sandbox.types import ExecResult, ExposedPortEndpoint, Permissions, User
 from ....sandbox.util.retry import (
     TRANSIENT_HTTP_STATUS_CODES,
     exception_chain_contains_type,
@@ -67,10 +74,157 @@ from ....sandbox.util.retry import (
     retry_async,
 )
 from ....sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
-from ....sandbox.workspace_paths import coerce_posix_path, posix_path_as_path, sandbox_path_str
+from ....sandbox.workspace_paths import (
+    coerce_posix_path,
+    posix_path_as_path,
+    posix_path_for_error,
+    sandbox_path_str,
+)
 
 DEFAULT_BLAXEL_WORKSPACE_ROOT = "/workspace"
 logger = logging.getLogger(__name__)
+
+_BLAXEL_MANAGED_PROCESS_TOKEN_ENV = "OPENAI_AGENTS_MANAGED_PROCESS_TOKEN"
+_BLAXEL_PROCESS_GROUP_MAX_START_POLLS = 20
+_BLAXEL_PROCESS_GROUP_TERM_POLLS = 10
+_BLAXEL_PROCESS_GROUP_TERM_POLL_S = 0.05
+_BLAXEL_PROCESS_STATUS_POLL_S = 0.05
+
+_BLAXEL_PROCESS_SUPERVISOR = f"""
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+def keep_supervisor_alive(_signum, _frame):
+    pass
+
+
+token = os.environ.get({_BLAXEL_MANAGED_PROCESS_TOKEN_ENV!r}, "").encode()
+needle = {_BLAXEL_MANAGED_PROCESS_TOKEN_ENV!r}.encode() + b"=" + token
+
+
+def owned_process_exists():
+    own_pid = os.getpid()
+    own_group = os.getpgrp()
+    for item in os.scandir("/proc"):
+        if not item.name.isdigit() or int(item.name) == own_pid:
+            continue
+        try:
+            process_path = f"/proc/{{item.name}}"
+            with open(f"{{process_path}}/stat", encoding="utf-8") as stream:
+                stat = stream.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            if int(fields[2]) == own_group:
+                return True
+            if token:
+                with open(f"{{process_path}}/environ", "rb") as stream:
+                    if needle in stream.read().split(b"\\0"):
+                        return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            continue
+    return False
+
+
+signal.signal(signal.SIGTERM, keep_supervisor_alive)
+process = subprocess.Popen(sys.argv[1:], start_new_session=True)
+status = process.wait()
+time.sleep({_BLAXEL_PROCESS_GROUP_TERM_POLL_S})
+while owned_process_exists():
+    time.sleep(0.05)
+raise SystemExit(128 - status if status < 0 else status)
+"""
+
+_BLAXEL_PROCESS_GROUP_TERMINATOR = f"""
+import os
+import signal
+import sys
+import time
+
+needle = {_BLAXEL_MANAGED_PROCESS_TOKEN_ENV!r}.encode() + b"=" + sys.argv[1].encode()
+
+
+def managed_groups():
+    groups = set()
+    for item in os.scandir("/proc"):
+        if not item.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{{item.name}}/environ", "rb") as stream:
+                if needle not in stream.read().split(b"\\0"):
+                    continue
+            with open(f"/proc/{{item.name}}/stat", encoding="utf-8") as stream:
+                stat = stream.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            pgid = int(fields[2])
+            if pgid > 1:
+                groups.add(pgid)
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            continue
+    return groups
+
+
+def signal_groups(groups, sig):
+    for pgid in groups:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+
+
+groups = set()
+start_polls = int(sys.argv[2])
+for attempt in range(start_polls):
+    groups = managed_groups()
+    if groups:
+        break
+    if attempt + 1 < start_polls:
+        time.sleep({_BLAXEL_PROCESS_GROUP_TERM_POLL_S})
+
+if groups:
+    signal_groups(groups, signal.SIGTERM)
+    for _ in range({_BLAXEL_PROCESS_GROUP_TERM_POLLS}):
+        groups = managed_groups()
+        if not groups:
+            break
+        time.sleep({_BLAXEL_PROCESS_GROUP_TERM_POLL_S})
+    else:
+        signal_groups(managed_groups(), signal.SIGKILL)
+"""
+
+
+def _blaxel_process_group_termination_command(
+    process_token: str,
+    *,
+    start_polls: int,
+) -> str:
+    return shlex.join(
+        ("python3", "-c", _BLAXEL_PROCESS_GROUP_TERMINATOR, process_token, str(start_polls))
+    )
+
+
+def _blaxel_supervised_command(command: Sequence[str | Path]) -> str:
+    return shlex.join(
+        ("exec", "python3", "-c", _BLAXEL_PROCESS_SUPERVISOR) + tuple(str(part) for part in command)
+    )
+
+
+def _blaxel_tty_command(
+    command: Sequence[str | Path],
+    process_token: str,
+    completion_token: str,
+) -> tuple[str, bytes]:
+    marker = f"\x1eOPENAI_AGENTS_EXIT:{completion_token}:".encode()
+    command_text = shlex.join(str(part) for part in command)
+    wrapped = (
+        f"env {_BLAXEL_MANAGED_PROCESS_TOKEN_ENV}={shlex.quote(process_token)} {command_text}; "
+        "__openai_agents_status=$?; "
+        f"printf '\\036OPENAI_AGENTS_EXIT:{completion_token}:%s\\037' "
+        '"$__openai_agents_status"'
+    )
+    return wrapped, marker
 
 
 # Blaxel documents structured API error codes and retryability at:
@@ -193,6 +347,26 @@ def _blaxel_exec_transport_error(
     )
 
 
+def _exec_result_from_blaxel_process(process: Any) -> ExecResult:
+    exit_code = int(getattr(process, "exit_code", 0) or 0)
+    has_split_streams = hasattr(process, "stdout") or hasattr(process, "stderr")
+    stdout = str(getattr(process, "stdout", "") or "")
+    stderr = str(getattr(process, "stderr", "") or "")
+    fallback = str(getattr(process, "logs", "") or getattr(process, "output", "") or "")
+
+    if has_split_streams:
+        return ExecResult(
+            stdout=stdout.encode("utf-8", errors="replace"),
+            stderr=stderr.encode("utf-8", errors="replace"),
+            exit_code=exit_code,
+        )
+
+    fallback_bytes = fallback.encode("utf-8", errors="replace")
+    if exit_code == 0:
+        return ExecResult(stdout=fallback_bytes, stderr=b"", exit_code=exit_code)
+    return ExecResult(stdout=b"", stderr=fallback_bytes, exit_code=exit_code)
+
+
 def _import_blaxel_sdk() -> Any:
     """Lazily import SandboxInstance from the Blaxel SDK, raising a clear error if missing."""
     try:
@@ -300,17 +474,31 @@ class BlaxelSandboxSessionState(SandboxSessionState):
 
 @dataclass
 class _BlaxelPtySessionEntry:
-    ws_session_id: str
-    ws: Any  # aiohttp.ClientWebSocketResponse
-    http_session: Any  # aiohttp.ClientSession
+    process_name: str | None = None
+    ws_session_id: str | None = None
+    ws: Any = None
+    http_session: Any = None
     tty: bool = True
+    process_token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    completion_marker: bytes | None = None
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_poll_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    termination_pending: bool = False
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
+    terminal_buffer: bytearray = field(default_factory=bytearray)
     last_used: float = field(default_factory=time.monotonic)
-    done: bool = False
     exit_code: int | None = None
-    reader_task: asyncio.Task[None] | None = None
+    wait_task: asyncio.Task[None] | None = None
+    consumed_log_bytes: int = 0
+    completion_tracks_descendants: bool = False
+
+
+@dataclass(frozen=True)
+class _BlaxelManagedProcessCommand:
+    argv: list[str]
+    completion_tracks_descendants: bool
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +512,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
     state: BlaxelSandboxSessionState
     _sandbox: Any  # SandboxInstance
     _token: str | None
+    _pty_launch_lock: asyncio.Lock
     _pty_lock: asyncio.Lock
     _pty_sessions: dict[int, _BlaxelPtySessionEntry]
     _reserved_pty_process_ids: set[int]
@@ -338,6 +527,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
         self.state = state
         self._sandbox = sandbox
         self._token = token
+        self._pty_launch_lock = asyncio.Lock()
         self._pty_lock = asyncio.Lock()
         self._pty_sessions = {}
         self._reserved_pty_process_ids = set()
@@ -565,59 +755,227 @@ class BlaxelSandboxSession(BaseSandboxSession):
         *command: str | Path,
         timeout: float | None = None,
     ) -> ExecResult:
-        cmd_str = shlex.join(str(c) for c in command)
         cwd = self.state.manifest.root
         exec_timeout = self._coerce_exec_timeout(timeout)
-        timeout_ms = int(max(1, math.ceil(exec_timeout)) * 1000)
-
-        # Resolve manifest + base env vars and prepend them so the executed
-        # process sees them.
-        envs = await self._resolved_envs()
-        if envs:
-            env_prefix = " ".join(f"{shlex.quote(k)}={shlex.quote(v)}" for k, v in envs.items())
-            cmd_str = f"env {env_prefix} {cmd_str}"
+        timeout_seconds = int(max(1, math.ceil(exec_timeout)))
+        deadline = time.monotonic() + exec_timeout
+        process_name = f"openai-agents-exec-{uuid.uuid4().hex}"
+        process_token = uuid.uuid4().hex
+        envs = {
+            **(await self._resolved_envs()),
+            _BLAXEL_MANAGED_PROCESS_TOKEN_ENV: process_token,
+        }
+        entry = _BlaxelPtySessionEntry(
+            process_name=process_name,
+            tty=False,
+            process_token=process_token,
+        )
 
         try:
             result = await asyncio.wait_for(
                 self._sandbox.process.exec(
                     {
-                        "command": cmd_str,
+                        "name": process_name,
+                        "command": _blaxel_supervised_command(command),
+                        "env": envs,
                         "working_dir": cwd,
-                        "wait_for_completion": True,
-                        "timeout": timeout_ms,
+                        "wait_for_completion": False,
+                        "timeout": timeout_seconds,
                     }
                 ),
-                timeout=exec_timeout,
+                timeout=min(self.state.timeouts.fast_op_s, exec_timeout),
             )
-
-            exit_code = int(getattr(result, "exit_code", 0) or 0)
-            # Blaxel ProcessResponse uses .stdout / .stderr / .logs attributes. Prefer
-            # split streams when available, and only fall back to logs/output for older SDKs.
-            has_split_streams = hasattr(result, "stdout") or hasattr(result, "stderr")
-            stdout = str(getattr(result, "stdout", "") or "")
-            stderr = str(getattr(result, "stderr", "") or "")
-            fallback = str(getattr(result, "logs", "") or getattr(result, "output", "") or "")
-            stdout_bytes = stdout.encode("utf-8", errors="replace")
-            stderr_bytes = stderr.encode("utf-8", errors="replace")
-
-            if has_split_streams:
-                return ExecResult(stdout=stdout_bytes, stderr=stderr_bytes, exit_code=exit_code)
-
-            fallback_bytes = fallback.encode("utf-8", errors="replace")
-            if exit_code == 0:
-                return ExecResult(stdout=fallback_bytes, stderr=b"", exit_code=exit_code)
-            return ExecResult(stdout=b"", stderr=fallback_bytes, exit_code=exit_code)
+            status = getattr(result, "status", "running")
+            status_value = getattr(status, "value", status)
+            if str(status_value).lower() == "running":
+                result = await asyncio.wait_for(
+                    self._wait_for_named_process(process_name),
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+            return _exec_result_from_blaxel_process(result)
         except asyncio.TimeoutError as e:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
             raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
+        except asyncio.CancelledError:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
+            raise
         except (ExecTimeoutError, ExecTransportError):
             raise
         except Exception as e:
+            await self._cleanup_named_exec(entry, reconcile_late_start=True)
             api_error_cls = _import_sandbox_api_error()
             if api_error_cls is not None and isinstance(e, api_error_cls):
                 status = getattr(e, "status_code", None)
                 if status in (408, 504):
                     raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
+
+    async def _wait_for_named_process(self, process_name: str) -> Any:
+        while True:
+            process = await self._sandbox.process.get(process_name)
+            status = getattr(process, "status", "running")
+            status_value = getattr(status, "value", status)
+            if str(status_value).lower() != "running":
+                return process
+            await asyncio.sleep(_BLAXEL_PROCESS_STATUS_POLL_S)
+
+    async def _cleanup_named_exec(
+        self,
+        entry: _BlaxelPtySessionEntry,
+        *,
+        reconcile_late_start: bool,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._terminate_pty_entry(
+                entry,
+                reconcile_late_start=reconcile_late_start,
+            )
+        )
+        await await_task_ignoring_cancellation(cleanup_task)
+
+    async def stat(
+        self,
+        path: Path | str,
+        *,
+        user: str | User | None = None,
+    ) -> FileEntry | None:
+        path_policy = self._workspace_path_policy()
+        original_path = coerce_posix_path(path)
+        workspace_path = path_policy.normalize_sandbox_path(path)
+        path_arg = workspace_path.as_posix()
+        grant_roots = tuple(
+            root.as_posix() for root, _read_only in path_policy.extra_path_grant_rules()
+        )
+        command = ("stat", path_arg)
+        result = await self.exec(
+            "python3",
+            "-c",
+            STAT_SCRIPT,
+            path_policy.sandbox_root().as_posix(),
+            path_arg,
+            *grant_roots,
+            timeout=self.state.timeouts.fast_op_s,
+            shell=False,
+            user=user,
+        )
+        if not result.ok():
+            raise ExecNonZeroError(result, command=command)
+
+        try:
+            stdout = result.stdout.decode("utf-8")
+            payload = json.loads(stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ExecTransportError(
+                command=command,
+                context={
+                    "reason": "malformed_stat_response",
+                    "stdout": result.stdout.decode("utf-8", errors="replace"),
+                    "stderr": result.stderr.decode("utf-8", errors="replace"),
+                },
+                cause=exc,
+                retryable=False,
+            ) from exc
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+
+        status = payload["status"]
+        if status == "missing":
+            if payload.get("component") == path_arg:
+                return None
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status == "escape":
+            resolved_path = payload.get("resolved_path")
+            if not isinstance(resolved_path, str) or not resolved_path:
+                raise ExecTransportError(
+                    command=command,
+                    context={"reason": "malformed_stat_response", "stdout": stdout},
+                    retryable=False,
+                )
+            reason: Literal["absolute", "escape_root"] = (
+                "absolute" if original_path.is_absolute() else "escape_root"
+            )
+            raise InvalidManifestPathError(
+                rel=original_path.as_posix(),
+                reason=reason,
+                context={"resolved_path": resolved_path},
+            )
+        if status == "invalid_grant_root":
+            component = payload.get("component")
+            if isinstance(component, str) and component:
+                raise ValueError(
+                    f"extra path grant must not resolve to filesystem root: {component}"
+                )
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status in {"missing_ancestor", "not_directory"}:
+            component = payload.get("component")
+            if isinstance(component, str) and component:
+                raise WorkspaceReadNotFoundError(
+                    path=posix_path_for_error(workspace_path),
+                    context={"reason": status, "component": component},
+                )
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        if status != "entry":
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+
+        mode = payload.get("mode")
+        owner = payload.get("owner")
+        group = payload.get("group")
+        size = payload.get("size")
+        if (
+            not isinstance(mode, int)
+            or isinstance(mode, bool)
+            or mode < 0
+            or not isinstance(owner, str)
+            or not isinstance(group, str)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+        ):
+            raise ExecTransportError(
+                command=command,
+                context={"reason": "malformed_stat_response", "stdout": stdout},
+                retryable=False,
+            )
+        kind = {
+            0o040000: EntryKind.DIRECTORY,
+            0o100000: EntryKind.FILE,
+            0o120000: EntryKind.SYMLINK,
+        }.get(mode & 0o170000, EntryKind.OTHER)
+        permissions = Permissions(
+            owner=(mode >> 6) & 0b111,
+            group=(mode >> 3) & 0b111,
+            other=mode & 0b111,
+            directory=kind == EntryKind.DIRECTORY,
+        )
+        return FileEntry(
+            path=path_arg,
+            permissions=permissions,
+            owner=owner,
+            group=group,
+            size=size,
+            kind=kind,
+        )
 
     # -- running check -------------------------------------------------------
 
@@ -771,6 +1129,17 @@ class BlaxelSandboxSession(BaseSandboxSession):
     def supports_pty(self) -> bool:
         return self.state.sandbox_url is not None and self._token is not None and _has_aiohttp()
 
+    async def _managed_process_command(
+        self,
+        sanitized_command: Sequence[str],
+        *,
+        process_token: str,
+    ) -> _BlaxelManagedProcessCommand:
+        return _BlaxelManagedProcessCommand(
+            argv=[str(part) for part in sanitized_command],
+            completion_tracks_descendants=True,
+        )
+
     async def pty_exec_start(
         self,
         *command: str | Path,
@@ -781,86 +1150,164 @@ class BlaxelSandboxSession(BaseSandboxSession):
         yield_time_s: float | None = None,
         max_output_tokens: int | None = None,
     ) -> PtyExecUpdate:
-        aiohttp = _import_aiohttp()
+        process_token = uuid.uuid4().hex
         sanitized = self._prepare_exec_command(*command, shell=shell, user=user)
-        cmd_str = shlex.join(str(part) for part in sanitized)
-        cwd = self.state.manifest.root
-        exec_timeout = timeout if timeout is not None else self.state.timeouts.exec_timeout_s
-
-        ws_session_id = f"pty-{uuid.uuid4().hex[:12]}"
-        ws_url = _build_ws_url(
-            sandbox_url=self.state.sandbox_url or "",
-            token=self._token or "",
-            session_id=ws_session_id,
-            cwd=cwd,
+        managed_command = await self._managed_process_command(
+            sanitized,
+            process_token=process_token,
         )
+        if isinstance(managed_command, _BlaxelManagedProcessCommand):
+            sanitized = managed_command.argv
+            completion_tracks_descendants = managed_command.completion_tracks_descendants
+        else:
+            sanitized = managed_command
+            completion_tracks_descendants = False
+        cwd = self.state.manifest.root
+        exec_timeout = self._coerce_exec_timeout(timeout)
+        process_name = None if tty else f"openai-agents-pty-{uuid.uuid4().hex}"
+        ws_session_id = f"pty-{uuid.uuid4().hex}" if tty else None
 
         entry = _BlaxelPtySessionEntry(
+            process_name=process_name,
             ws_session_id=ws_session_id,
             ws=None,
             http_session=None,
-            tty=True,
+            tty=tty,
+            process_token=process_token,
+            completion_tracks_descendants=completion_tracks_descendants and not tty,
         )
 
         registered = False
-        pruned: _BlaxelPtySessionEntry | None = None
+        pruned_entry: tuple[int, _BlaxelPtySessionEntry] | None = None
+        process_id = 0
         process_count = 0
+        provider_launch_attempted = False
+
+        async def _launch() -> None:
+            nonlocal process_count, process_id, provider_launch_attempted
+            nonlocal pruned_entry, registered
+            async with self._pty_launch_lock:
+                async with self._pty_lock:
+                    process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+                    self._reserved_pty_process_ids.add(process_id)
+                    pruned_entry = self._prune_pty_sessions_if_needed()
+                    if len(self._pty_sessions) >= PTY_PROCESSES_MAX and pruned_entry is None:
+                        self._reserved_pty_process_ids.discard(process_id)
+                        raise RuntimeError(
+                            "PTY process limit reached while all registered sessions "
+                            "are terminating"
+                        )
+                if pruned_entry is not None:
+                    await self._retire_registered_pty_entry(
+                        process_id=pruned_entry[0],
+                        entry=pruned_entry[1],
+                    )
+
+                provider_launch_attempted = True
+                if tty:
+                    aiohttp = _import_aiohttp()
+                    ws_url = _build_ws_url(
+                        sandbox_url=self.state.sandbox_url or "",
+                        token=self._token or "",
+                        session_id=ws_session_id or "",
+                        cwd=cwd,
+                    )
+                    entry.http_session = aiohttp.ClientSession()
+                    entry.ws = await asyncio.wait_for(
+                        entry.http_session.ws_connect(ws_url),
+                        timeout=min(self.state.timeouts.fast_op_s, exec_timeout),
+                    )
+                    command_text, entry.completion_marker = _blaxel_tty_command(
+                        sanitized,
+                        process_token,
+                        uuid.uuid4().hex,
+                    )
+                    entry.wait_task = asyncio.create_task(self._pty_ws_reader(entry))
+                    await asyncio.wait_for(
+                        entry.ws.send_str(
+                            json.dumps({"type": "input", "data": command_text + "\n"})
+                        ),
+                        timeout=self.state.timeouts.fast_op_s,
+                    )
+                else:
+                    envs = {
+                        **(await self._resolved_envs()),
+                        _BLAXEL_MANAGED_PROCESS_TOKEN_ENV: process_token,
+                    }
+                    await asyncio.wait_for(
+                        self._sandbox.process.exec(
+                            {
+                                "name": process_name,
+                                "command": _blaxel_supervised_command(sanitized),
+                                "env": envs,
+                                "working_dir": cwd,
+                                "wait_for_completion": False,
+                                "timeout": int(max(1, math.ceil(exec_timeout))),
+                            }
+                        ),
+                        timeout=self.state.timeouts.fast_op_s,
+                    )
+                    entry.wait_task = asyncio.create_task(self._run_process_waiter(entry))
+
+                async with self._pty_lock:
+                    self._pty_sessions[process_id] = entry
+                    process_count = len(self._pty_sessions)
+                    registered = True
+
+        launch_task = asyncio.create_task(_launch())
+        try:
+            await asyncio.shield(launch_task)
+        except BaseException as error:
+            await self._finish_unreturned_launch(
+                launch_task=launch_task,
+                entry=entry,
+                registration=lambda: (registered, process_id),
+                provider_launch_attempted=lambda: provider_launch_attempted,
+            )
+            if pruned_entry is not None:
+                await await_task_ignoring_cancellation(
+                    asyncio.create_task(self._cancel_pty_prune(pruned_entry))
+                )
+            if not registered and process_id:
+                async with self._pty_lock:
+                    self._reserved_pty_process_ids.discard(process_id)
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, ExecTransportError):
+                raise
+            if isinstance(error, TimeoutError):
+                raise ExecTimeoutError(
+                    command=command,
+                    timeout_s=exec_timeout,
+                    cause=error,
+                ) from error
+            raise _blaxel_exec_transport_error(command=command, cause=error) from error
 
         try:
-            http_session = aiohttp.ClientSession()
-            entry.http_session = http_session
-            ws = await asyncio.wait_for(
-                http_session.ws_connect(ws_url),
-                timeout=exec_timeout,
-            )
-            entry.ws = ws
+            if process_count >= PTY_PROCESSES_WARNING:
+                logger.warning(
+                    "PTY process count reached warning threshold: %s active sessions",
+                    process_count,
+                )
 
-            # Start background reader.
-            entry.reader_task = asyncio.create_task(self._pty_ws_reader(entry))
-
-            # Send command.
-            await asyncio.wait_for(
-                ws.send_str(json.dumps({"type": "input", "data": cmd_str + "\n"})),
-                timeout=self.state.timeouts.fast_op_s,
-            )
-
-            async with self._pty_lock:
-                process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
-                self._reserved_pty_process_ids.add(process_id)
-                pruned = self._prune_pty_sessions_if_needed()
-                self._pty_sessions[process_id] = entry
-                process_count = len(self._pty_sessions)
-                registered = True
-        except asyncio.TimeoutError as e:
-            if not registered:
-                await self._terminate_pty_entry(entry)
-            raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
-        except Exception as e:
-            if not registered:
-                await self._terminate_pty_entry(entry)
-            raise _blaxel_exec_transport_error(command=command, cause=e) from e
-
-        if pruned is not None:
-            await self._terminate_pty_entry(pruned)
-
-        if process_count >= PTY_PROCESSES_WARNING:
-            logger.warning(
-                "PTY process count reached warning threshold: %s active sessions",
-                process_count,
-            )
-
-        yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
-            max_output_tokens=max_output_tokens,
-        )
-        return await self._finalize_pty_update(
-            process_id=process_id,
-            entry=entry,
-            output=output,
-            original_token_count=original_token_count,
-        )
+            async with entry.output_poll_lock:
+                yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
+                    max_output_tokens=max_output_tokens,
+                )
+                return await self._finalize_pty_update(
+                    process_id=process_id,
+                    entry=entry,
+                    output=output,
+                    original_token_count=original_token_count,
+                )
+        except BaseException:
+            await self._finish_unreturned_registered_entry(process_id=process_id, entry=entry)
+            raise
 
     async def pty_write_stdin(
         self,
@@ -876,41 +1323,197 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 session_id=session_id,
             )
 
-        if chars and entry.ws is not None:
-            await asyncio.wait_for(
-                entry.ws.send_str(json.dumps({"type": "input", "data": chars})),
-                timeout=self.state.timeouts.fast_op_s,
-            )
-            await asyncio.sleep(0.1)
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_sessions.get(session_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=session_id)
+                if entry.termination_pending:
+                    raise PtySessionNotFoundError(session_id=session_id)
 
-        yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
-            entry=entry,
-            yield_time_ms=resolve_pty_write_yield_time_ms(
-                yield_time_ms=yield_time_ms, input_empty=chars == ""
-            ),
-            max_output_tokens=max_output_tokens,
+            if chars:
+                if not entry.tty:
+                    raise RuntimeError("stdin is not available for this process")
+                await asyncio.wait_for(
+                    entry.ws.send_str(json.dumps({"type": "input", "data": chars})),
+                    timeout=self.state.timeouts.fast_op_s,
+                )
+                await asyncio.sleep(0.1)
+
+        async with entry.output_poll_lock:
+            yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
+            output, original_token_count = await self._collect_pty_output(
+                entry=entry,
+                yield_time_ms=resolve_pty_write_yield_time_ms(
+                    yield_time_ms=yield_time_ms, input_empty=chars == ""
+                ),
+                max_output_tokens=max_output_tokens,
+            )
+            entry.last_used = time.monotonic()
+            return await self._finalize_pty_update(
+                process_id=session_id,
+                entry=entry,
+                output=output,
+                original_token_count=original_token_count,
+            )
+
+    async def pty_terminate(self, session_id: int) -> PtyExecUpdate:
+        async with self._pty_lock:
+            entry = self._resolve_pty_session_entry(
+                pty_processes=self._pty_sessions,
+                session_id=session_id,
+            )
+
+        retirement_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=session_id, entry=entry)
         )
-        entry.last_used = time.monotonic()
-        return await self._finalize_pty_update(
-            process_id=session_id,
-            entry=entry,
+        try:
+            return await asyncio.shield(retirement_task)
+        except asyncio.CancelledError:
+            try:
+                await await_task_ignoring_cancellation(retirement_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Blaxel targeted PTY cleanup failed after caller cancellation.",
+                    extra={"process_id": session_id},
+                    exc_info=cleanup_error,
+                )
+            raise
+
+    async def _retire_registered_pty_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _BlaxelPtySessionEntry,
+    ) -> PtyExecUpdate:
+        async with entry.operation_lock:
+            async with self._pty_lock:
+                if self._pty_sessions.get(process_id) is not entry:
+                    raise PtySessionNotFoundError(session_id=process_id)
+                entry.termination_pending = True
+
+            await self._terminate_pty_entry(entry, best_effort=False)
+            async with entry.output_poll_lock:
+                output, original_token_count = await self._collect_pty_output(
+                    entry=entry,
+                    yield_time_ms=0,
+                    max_output_tokens=None,
+                )
+                async with self._pty_lock:
+                    if self._pty_sessions.get(process_id) is not entry:
+                        raise PtySessionNotFoundError(session_id=process_id)
+                    self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
+
+        return PtyExecUpdate(
+            process_id=None,
             output=output,
+            exit_code=self._entry_exit_code(entry),
             original_token_count=original_token_count,
         )
 
-    async def pty_terminate_all(self) -> None:
+    async def _finish_unreturned_launch(
+        self,
+        *,
+        launch_task: asyncio.Task[None],
+        entry: _BlaxelPtySessionEntry,
+        registration: Callable[[], tuple[bool, int]],
+        provider_launch_attempted: Callable[[], bool],
+    ) -> None:
+        if not launch_task.done():
+            try:
+                await await_task_ignoring_cancellation(launch_task)
+            except BaseException:
+                pass
+
+        registered, process_id = registration()
+        if registered:
+            await self._finish_unreturned_registered_entry(process_id=process_id, entry=entry)
+            return
+        if not provider_launch_attempted():
+            return
+
+        cleanup_task = asyncio.create_task(
+            self._terminate_pty_entry(
+                entry,
+                best_effort=False,
+                reconcile_late_start=True,
+            )
+        )
+        try:
+            await await_task_ignoring_cancellation(cleanup_task)
+        except BaseException as cleanup_error:
+            retention_task = asyncio.create_task(self._retain_unreturned_pty_entry(entry))
+            process_id = await await_task_ignoring_cancellation(retention_task)
+            logger.warning(
+                "Blaxel PTY cleanup failed before process registration.",
+                extra={"process_id": process_id},
+                exc_info=cleanup_error,
+            )
+
+    async def _retain_unreturned_pty_entry(self, entry: _BlaxelPtySessionEntry) -> int:
         async with self._pty_lock:
-            entries = list(self._pty_sessions.values())
-            self._pty_sessions.clear()
-            self._reserved_pty_process_ids.clear()
-        for entry in entries:
-            await self._terminate_pty_entry(entry)
+            process_id = allocate_pty_process_id(self._reserved_pty_process_ids)
+            self._reserved_pty_process_ids.add(process_id)
+            entry.termination_pending = True
+            self._pty_sessions[process_id] = entry
+            return process_id
+
+    async def _finish_unreturned_registered_entry(
+        self,
+        *,
+        process_id: int,
+        entry: _BlaxelPtySessionEntry,
+    ) -> None:
+        cleanup_task = asyncio.create_task(
+            self._retire_registered_pty_entry(process_id=process_id, entry=entry)
+        )
+        try:
+            await await_task_ignoring_cancellation(cleanup_task)
+        except BaseException as cleanup_error:
+            logger.warning(
+                "Blaxel PTY cleanup failed before its process ID was returned.",
+                extra={"process_id": process_id},
+                exc_info=cleanup_error,
+            )
+
+    async def pty_terminate_all(self) -> None:
+        cleanup_task = asyncio.create_task(self._terminate_all_pty_entries())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await await_task_ignoring_cancellation(cleanup_task)
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Blaxel PTY cleanup failed after caller cancellation.",
+                    exc_info=cleanup_error,
+                )
+            raise cancellation
+
+    async def _terminate_all_pty_entries(self) -> None:
+        async with self._pty_launch_lock:
+            async with self._pty_lock:
+                entries = list(self._pty_sessions.items())
+
+            first_error: Exception | None = None
+            for process_id, entry in entries:
+                try:
+                    await self._retire_registered_pty_entry(process_id=process_id, entry=entry)
+                except PtySessionNotFoundError:
+                    continue
+                except Exception as error:
+                    first_error = first_error or error
+                    logger.warning(
+                        "Failed to terminate Blaxel PTY process during session cleanup.",
+                        extra={"process_id": process_id},
+                        exc_info=error,
+                    )
+            if first_error is not None:
+                raise first_error
 
     # -- PTY internals -------------------------------------------------------
 
     async def _pty_ws_reader(self, entry: _BlaxelPtySessionEntry) -> None:
-        """Background task that reads WebSocket messages into *entry.output_chunks*."""
         try:
             aiohttp = _import_aiohttp()
             async for msg in entry.ws:
@@ -927,17 +1530,18 @@ class BlaxelSandboxSession(BaseSandboxSession):
                             raw = (data.get("data", "") or data.get("Data", "")).encode(
                                 "utf-8", errors="replace"
                             )
-                            async with entry.output_lock:
-                                entry.output_chunks.append(raw)
-                            entry.output_notify.set()
+                            visible, exit_code = self._consume_terminal_output(entry, raw)
+                            await self._append_pty_output(entry, visible)
+                            if exit_code is not None:
+                                entry.exit_code = exit_code
+                                break
                         elif msg_type == "error":
                             raw = (data.get("data", "") or data.get("Data", "")).encode(
                                 "utf-8", errors="replace"
                             )
-                            async with entry.output_lock:
-                                entry.output_chunks.append(raw)
-                            entry.done = True
-                            entry.output_notify.set()
+                            await self._append_pty_output(entry, raw)
+                            entry.exit_code = 1
+                            break
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         logger.debug("PTY ws reader: ignoring malformed message")
                 elif msg.type in (
@@ -949,8 +1553,100 @@ class BlaxelSandboxSession(BaseSandboxSession):
         except Exception as e:
             logger.debug("PTY ws reader terminated with error: %s", e)
         finally:
-            entry.done = True
+            if entry.terminal_buffer:
+                await self._append_pty_output(entry, bytes(entry.terminal_buffer))
+                entry.terminal_buffer.clear()
+            if entry.exit_code is None and not entry.termination_pending:
+                entry.exit_code = 1
             entry.output_notify.set()
+
+    async def _run_process_waiter(self, entry: _BlaxelPtySessionEntry) -> None:
+        assert entry.process_name is not None
+        try:
+            while True:
+                try:
+                    process = await self._sandbox.process.get(entry.process_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if entry.termination_pending:
+                        return
+                    logger.debug("Blaxel process poll failed; retrying: %s", error)
+                    await asyncio.sleep(_BLAXEL_PROCESS_STATUS_POLL_S)
+                    continue
+                logs = str(getattr(process, "logs", "") or "")
+                encoded_logs = logs.encode("utf-8", errors="replace")
+                if len(encoded_logs) > entry.consumed_log_bytes:
+                    await self._append_pty_output(
+                        entry,
+                        encoded_logs[entry.consumed_log_bytes :],
+                    )
+                    entry.consumed_log_bytes = len(encoded_logs)
+
+                status = str(getattr(process, "status", "running") or "running").lower()
+                if status != "running":
+                    value = getattr(process, "exit_code", None)
+                    entry.exit_code = int(value) if value is not None else 1
+                    break
+                await asyncio.sleep(_BLAXEL_PROCESS_STATUS_POLL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not entry.termination_pending:
+                logger.debug("Blaxel process waiter failed: %s", error)
+                entry.exit_code = 1
+        finally:
+            entry.output_notify.set()
+
+    async def _append_pty_output(
+        self,
+        entry: _BlaxelPtySessionEntry,
+        payload: bytes,
+    ) -> None:
+        if not payload:
+            return
+        async with entry.output_lock:
+            entry.output_chunks.append(payload)
+        entry.output_notify.set()
+
+    def _consume_terminal_output(
+        self,
+        entry: _BlaxelPtySessionEntry,
+        payload: bytes,
+    ) -> tuple[bytes, int | None]:
+        marker = entry.completion_marker
+        if marker is None:
+            return payload, None
+
+        entry.terminal_buffer.extend(payload)
+        marker_index = entry.terminal_buffer.find(marker)
+        if marker_index >= 0:
+            suffix_index = entry.terminal_buffer.find(b"\x1f", marker_index + len(marker))
+            if suffix_index < 0:
+                visible = bytes(entry.terminal_buffer[:marker_index])
+                del entry.terminal_buffer[:marker_index]
+                return visible, None
+            visible = bytes(entry.terminal_buffer[:marker_index])
+            exit_code_bytes = bytes(
+                entry.terminal_buffer[marker_index + len(marker) : suffix_index]
+            )
+            entry.terminal_buffer.clear()
+            try:
+                return visible, int(exit_code_bytes.decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                return visible, 1
+
+        keep = 0
+        for size in range(min(len(entry.terminal_buffer), len(marker) - 1), 0, -1):
+            if entry.terminal_buffer[-size:] == marker[:size]:
+                keep = size
+                break
+        visible_size = len(entry.terminal_buffer) - keep
+        if visible_size <= 0:
+            return b"", None
+        visible = bytes(entry.terminal_buffer[:visible_size])
+        del entry.terminal_buffer[:visible_size]
+        return visible, None
 
     async def _collect_pty_output(
         self,
@@ -959,14 +1655,34 @@ class BlaxelSandboxSession(BaseSandboxSession):
         yield_time_ms: int,
         max_output_tokens: int | None,
     ) -> tuple[bytes, int | None]:
-        return await collect_pty_output(
-            output_chunks=entry.output_chunks,
-            output_lock=entry.output_lock,
-            output_notify=entry.output_notify,
-            is_done=lambda: entry.done,
-            yield_time_ms=yield_time_ms,
-            max_output_tokens=max_output_tokens,
-        )
+        deadline = time.monotonic() + (yield_time_ms / 1000)
+        output = bytearray()
+
+        while True:
+            async with entry.output_lock:
+                while entry.output_chunks:
+                    output.extend(entry.output_chunks.popleft())
+
+            if time.monotonic() >= deadline:
+                break
+            if self._entry_exit_code(entry) is not None:
+                async with entry.output_lock:
+                    while entry.output_chunks:
+                        output.extend(entry.output_chunks.popleft())
+                break
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            try:
+                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
+            except asyncio.TimeoutError:
+                break
+            entry.output_notify.clear()
+
+        text = output.decode("utf-8", errors="replace")
+        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
+        return truncated_text.encode("utf-8", errors="replace"), original_token_count
 
     async def _finalize_pty_update(
         self,
@@ -976,16 +1692,30 @@ class BlaxelSandboxSession(BaseSandboxSession):
         output: bytes,
         original_token_count: int | None,
     ) -> PtyExecUpdate:
-        exit_code = entry.exit_code if entry.done else None
+        exit_code = self._entry_exit_code(entry)
         live_process_id: int | None = process_id
 
-        if entry.done:
+        if exit_code is not None and not entry.termination_pending:
             async with self._pty_lock:
-                removed = self._pty_sessions.pop(process_id, None)
-                self._reserved_pty_process_ids.discard(process_id)
-            if removed is not None:
-                await self._terminate_pty_entry(removed)
+                if self._pty_sessions.get(process_id) is not entry:
+                    return PtyExecUpdate(
+                        process_id=None,
+                        output=output,
+                        exit_code=exit_code,
+                        original_token_count=original_token_count,
+                    )
+                entry.termination_pending = True
+            if not entry.completion_tracks_descendants:
+                await self._terminate_pty_entry(entry, best_effort=False)
+            async with self._pty_lock:
+                if self._pty_sessions.get(process_id) is entry:
+                    self._pty_sessions.pop(process_id)
+                    self._reserved_pty_process_ids.discard(process_id)
             live_process_id = None
+        else:
+            async with self._pty_lock:
+                if self._pty_sessions.get(process_id) is not entry:
+                    live_process_id = None
 
         return PtyExecUpdate(
             process_id=live_process_id,
@@ -994,38 +1724,139 @@ class BlaxelSandboxSession(BaseSandboxSession):
             original_token_count=original_token_count,
         )
 
-    def _prune_pty_sessions_if_needed(self) -> _BlaxelPtySessionEntry | None:
+    def _prune_pty_sessions_if_needed(
+        self,
+    ) -> tuple[int, _BlaxelPtySessionEntry] | None:
         if len(self._pty_sessions) < PTY_PROCESSES_MAX:
             return None
         meta: list[tuple[int, float, bool]] = [
-            (pid, e.last_used, e.done) for pid, e in self._pty_sessions.items()
+            (process_id, entry.last_used, self._entry_exit_code(entry) is not None)
+            for process_id, entry in self._pty_sessions.items()
+            if not entry.termination_pending
         ]
-        pid = process_id_to_prune_from_meta(meta)
-        if pid is None:
+        process_id = process_id_to_prune_from_meta(meta)
+        if process_id is None:
             return None
-        self._reserved_pty_process_ids.discard(pid)
-        return self._pty_sessions.pop(pid, None)
+        entry = self._pty_sessions[process_id]
+        entry.termination_pending = True
+        return process_id, entry
 
-    async def _terminate_pty_entry(self, entry: _BlaxelPtySessionEntry) -> None:
+    async def _cancel_pty_prune(
+        self,
+        pruned: tuple[int, _BlaxelPtySessionEntry],
+    ) -> None:
+        process_id, entry = pruned
+        async with self._pty_lock:
+            if self._pty_sessions.get(process_id) is entry:
+                entry.termination_pending = False
+
+    def _entry_exit_code(self, entry: _BlaxelPtySessionEntry) -> int | None:
+        if entry.exit_code is None:
+            return None
         try:
-            if entry.reader_task is not None and not entry.reader_task.done():
-                entry.reader_task.cancel()
-                try:
-                    await entry.reader_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if entry.ws is not None:
-                try:
-                    await entry.ws.close()
-                except Exception as e:
-                    logger.debug("PTY ws close error (non-fatal): %s", e)
-            if entry.http_session is not None:
-                try:
-                    await entry.http_session.close()
-                except Exception as e:
-                    logger.debug("PTY http session close error (non-fatal): %s", e)
-        except Exception as e:
-            logger.debug("PTY entry termination error (non-fatal): %s", e)
+            return int(entry.exit_code)
+        except (TypeError, ValueError):
+            return None
+
+    async def _terminate_pty_entry(
+        self,
+        entry: _BlaxelPtySessionEntry,
+        *,
+        best_effort: bool = True,
+        reconcile_late_start: bool = False,
+    ) -> None:
+        termination_error: Exception | None = None
+        try:
+            await self._terminate_blaxel_process_group(
+                entry.process_token,
+                reconcile_late_start=reconcile_late_start,
+            )
+        except Exception as error:
+            termination_error = error
+
+        if entry.process_name is not None:
+            try:
+                await asyncio.wait_for(
+                    self._sandbox.process.kill(entry.process_name),
+                    timeout=self.state.timeouts.cleanup_s,
+                )
+            except Exception as error:
+                if not self._provider_process_is_absent(error):
+                    termination_error = termination_error or error
+
+        try:
+            await self._close_pty_transport(entry)
+        except Exception as error:
+            termination_error = termination_error or error
+
+        if entry.exit_code is None:
+            entry.exit_code = 137
+        entry.output_notify.set()
+
+        if termination_error is not None and not best_effort:
+            raise termination_error
+
+        wait_task = entry.wait_task
+        if wait_task is not None:
+            if best_effort and not wait_task.done():
+                wait_task.cancel()
+            if best_effort:
+                await asyncio.gather(wait_task, return_exceptions=True)
+            else:
+                await self._await_pty_waiter(entry)
+
+    async def _terminate_blaxel_process_group(
+        self,
+        process_token: str,
+        *,
+        reconcile_late_start: bool,
+    ) -> None:
+        start_polls = 1
+        if reconcile_late_start:
+            available_s = min(
+                (_BLAXEL_PROCESS_GROUP_MAX_START_POLLS - 1) * _BLAXEL_PROCESS_GROUP_TERM_POLL_S,
+                max(0.0, self.state.timeouts.cleanup_s - 0.5),
+            )
+            start_polls += int(available_s / _BLAXEL_PROCESS_GROUP_TERM_POLL_S)
+        await asyncio.wait_for(
+            self._sandbox.process.exec(
+                {
+                    "name": f"openai-agents-cleanup-{uuid.uuid4().hex}",
+                    "command": _blaxel_process_group_termination_command(
+                        process_token,
+                        start_polls=start_polls,
+                    ),
+                    "working_dir": "/",
+                    "wait_for_completion": True,
+                    "timeout": int(max(1, math.ceil(self.state.timeouts.cleanup_s))),
+                }
+            ),
+            timeout=self.state.timeouts.cleanup_s,
+        )
+
+    async def _close_pty_transport(self, entry: _BlaxelPtySessionEntry) -> None:
+        if entry.ws is not None:
+            await entry.ws.close()
+        if entry.http_session is not None:
+            await entry.http_session.close()
+
+    async def _await_pty_waiter(self, entry: _BlaxelPtySessionEntry) -> None:
+        wait_task = entry.wait_task
+        if wait_task is None:
+            return
+        _, pending = await asyncio.wait({wait_task}, timeout=self.state.timeouts.cleanup_s)
+        if not pending:
+            return
+
+        wait_task.cancel()
+        _, pending = await asyncio.wait({wait_task}, timeout=self.state.timeouts.cleanup_s)
+        if pending:
+            raise TimeoutError("Blaxel PTY output waiter did not stop after termination")
+
+    def _provider_process_is_absent(self, error: Exception) -> bool:
+        status = getattr(error, "status_code", None) or getattr(error, "status", None)
+        error_text = str(error).lower()
+        return status == 404 or "not found" in error_text
 
 
 # ---------------------------------------------------------------------------
