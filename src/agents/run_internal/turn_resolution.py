@@ -715,24 +715,34 @@ async def execute_tools_and_side_effects(
         context_wrapper=context_wrapper,
         run_config=run_config,
     )
-    new_step_items.extend(
-        _build_tool_result_items(
-            function_results=function_results,
-            computer_results=computer_results,
-            custom_tool_results=custom_tool_results,
-            shell_results=shell_results,
-            apply_patch_results=apply_patch_results,
-            local_shell_results=local_shell_results,
-        )
+    tool_result_items = _build_tool_result_items(
+        function_results=function_results,
+        computer_results=computer_results,
+        custom_tool_results=custom_tool_results,
+        shell_results=shell_results,
+        apply_patch_results=apply_patch_results,
+        local_shell_results=local_shell_results,
     )
-    new_step_items.extend(
-        await _build_tool_not_found_output_items(
-            agent=public_agent,
-            calls=processed_response.function_tools_not_found,
-            context_wrapper=context_wrapper,
-            run_config=run_config,
-        )
+    not_found_items = await _build_tool_not_found_output_items(
+        agent=public_agent,
+        calls=processed_response.function_tools_not_found,
+        context_wrapper=context_wrapper,
+        run_config=run_config,
     )
+    if not_found_items:
+        tool_result_items.extend(not_found_items)
+        # Missing-tool errors belong in the same model-call order as function results.
+        function_call_order: dict[str | None, int] = {
+            call.call_id: index
+            for index, call in enumerate(new_response.output)
+            if isinstance(call, ResponseFunctionToolCall)
+        }
+        tool_result_items.sort(
+            key=lambda item: function_call_order.get(
+                extract_tool_call_id(item.raw_item), len(new_response.output)
+            )
+        )
+    new_step_items.extend(tool_result_items)
 
     interruptions = _collect_tool_interruptions(
         function_results=function_results,
