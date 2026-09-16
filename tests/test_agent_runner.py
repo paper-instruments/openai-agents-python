@@ -58,6 +58,7 @@ from agents.items import (
     TResponseInputItem,
 )
 from agents.lifecycle import RunHooks
+from agents.result import RunResultBase
 from agents.run import AgentRunner, get_default_agent_runner, set_default_agent_runner
 from agents.run_config import _default_trace_include_sensitive_data
 from agents.run_internal.agent_bindings import bind_public_agent
@@ -4537,14 +4538,19 @@ async def test_tool_not_found_behavior_uses_tool_error_formatter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_not_found_behavior_handles_mixed_function_tool_calls() -> None:
+@pytest.mark.parametrize("missing_position", [0, 1, 2])
+@pytest.mark.parametrize("concurrency", [1, None])
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_tool_not_found_behavior_handles_mixed_function_tool_calls(
+    missing_position: int, concurrency: int | None, streamed: bool
+) -> None:
     model = FakeModel()
     calls: list[str] = []
 
     @function_tool(name_override="known_tool")
-    async def known_tool() -> str:
-        calls.append("known_tool")
-        return "known result"
+    async def known_tool(value: str) -> str:
+        calls.append(value)
+        return value
 
     agent = Agent(
         name="test",
@@ -4552,35 +4558,61 @@ async def test_tool_not_found_behavior_handles_mixed_function_tool_calls() -> No
         tools=[known_tool],
         tool_use_behavior="run_llm_again",
     )
-    model.add_multiple_turn_outputs(
-        [
-            [
-                get_function_tool_call("missing_tool", "{}", call_id="call_missing"),
-                get_function_tool_call("known_tool", "{}", call_id="call_known"),
-            ],
-            [get_text_message("done")],
-        ]
+    tool_calls = [
+        get_function_tool_call("known_tool", '{"value":"first"}', call_id="call_first"),
+        get_function_tool_call("known_tool", '{"value":"second"}', call_id="call_second"),
+    ]
+    tool_calls.insert(
+        missing_position,
+        get_function_tool_call("missing_tool", "{}", call_id="call_missing"),
     )
-
-    result = await Runner.run(
-        agent,
-        input="start",
-        run_config=RunConfig(tool_not_found_behavior="return_error_to_model"),
+    model.add_multiple_turn_outputs([tool_calls, [get_text_message("done")]])
+    session = SQLiteSession("mixed-tool-order")
+    run_config = RunConfig(
+        tool_not_found_behavior="return_error_to_model",
+        tool_execution=ToolExecutionConfig(max_function_tool_concurrency=concurrency),
     )
+    streamed_outputs = []
+    result: RunResultBase
+    if streamed:
+        result = Runner.run_streamed(agent, input="start", session=session, run_config=run_config)
+        async for event in result.stream_events():
+            if event.type == "run_item_stream_event" and isinstance(event.item, ToolCallOutputItem):
+                streamed_outputs.append(event.item.to_input_item())
+    else:
+        result = await Runner.run(agent, input="start", session=session, run_config=run_config)
 
-    assert calls == ["known_tool"]
+    assert calls == ["first", "second"]
     assert result.final_output == "done"
-    second_turn_input = model.last_turn_args["input"]
-    assert isinstance(second_turn_input, list)
-    tool_outputs = {
-        item.get("call_id"): item.get("output")
-        for item in second_turn_input
-        if isinstance(item, dict) and item.get("type") == "function_call_output"
-    }
-    assert tool_outputs == {
-        "call_known": "known result",
+    outputs = {
+        "call_first": "first",
+        "call_second": "second",
         "call_missing": "Tool 'missing_tool' not found.",
     }
+    expected = []
+    for call in tool_calls:
+        assert isinstance(call, ResponseFunctionToolCall)
+        expected.append(
+            {
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": outputs[call.call_id],
+            }
+        )
+    for history in (
+        model.last_turn_args["input"],
+        result.to_input_list(),
+        await session.get_items(),
+    ):
+        assert isinstance(history, list)
+        assert [
+            item
+            for item in history
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ] == expected
+    if streamed:
+        assert streamed_outputs == expected
+    session.close()
 
 
 @pytest.mark.asyncio
